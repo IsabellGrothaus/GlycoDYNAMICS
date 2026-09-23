@@ -1,0 +1,54 @@
+;
+; Run parameters
+;
+integrator              = md                            ; leap-frag integrator
+dt                      = 0.002                         ; 1 fs
+nsteps                  = 250000000                        ; 2 * 100000 = 1ns
+;
+; Output control
+;
+nstxout-compressed      = 5000                           ; save coordinates every 1 ps
+nstvout                 = 0                          ; save velocities every 1 ps
+nstfout                 = 0                          ; save forces every 1 ps
+nstcalcenergy           = 5000
+nstenergy               = 5000                           ; saves energies every 1 ps
+nstlog                  = 5000                           ; update log file every 1 ps
+;
+; Nonbonded settings with electrostatics
+;
+cutoff-scheme           = Verlet                        ; Buffered neighbor searching
+nstlist                 = 10                            ; 20 fs, largely irrelevant with Verlet
+rlist                   = 1.2                           ;(default for CHARMM36)
+coulombtype             = pme                           ;(default for CHARMM36), Particle Mesh Ewald for long-range electrostatics
+rcoulomb                = 1.2                           ; Short-range electrostatic cuf-off (default for CHARMM36)
+vdwtype                 = Cut-off                       ;(default for CHARMM36)
+vdw-modifier            = Force-switch                  ;(default for CHARMM36)
+rvdw_switch             = 1.0                           ;(default for CHARMM36)
+rvdw                    = 1.2                           ; Short-range van der Waals cuf-off (default for CHARMM36)
+DispCorr                = no
+;
+; Temperature coupling parameters
+;
+tcoupl                  = V-rescale                     ; modified Berendsen thermostat
+tc_grps                 = SYSTEM
+tau_t                   = 0.1                      ; time constant for coupling, in ps
+ref_t                   = 310.15
+;
+; Pressure coupling parameters
+;
+pcoupl                  = Parrinello-Rahman             ;
+pcoupltype              = isotropic                     ; the kind of isotropy of the pressure coupling
+tau_p                   = 5.0                           ; time constant for pressure coupling, should be not too short for Parrinello-Rahman
+compressibility         = 4.5e-5                        ; in bar, for water at 1 atm and 300K = 4.5e-5 bar
+ref_p                   = 1.0                           ; reference pressure for coupling in bar
+;
+constraints             = h-bonds                       ; bonds involving H are constrained
+constraint_algorithm    = LINCS                         ; holonomic constraints
+;
+nstcomm                 = 5000                           ; needed?
+comm_mode               = linear
+comm_grps               = SYSTEM
+continuation		= yes
+;
+refcoord_scaling        = com
+
