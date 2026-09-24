@@ -22,7 +22,7 @@ export GMX_GPU_FORCE_UPDATE_DEFAULT_GPU=true
 
 export OMP_NUM_THREADS=6
 
-mpiexec -np 12 gmx_mpi_plumed mdrun -ntomp $OMP_NUM_THREADS -s topol.tpr -pme gpu -nb gpu -update cpu -bonded gpu -pin on -pinstride 1 -plumed plumed_allangle.dat -multidir TOPO? TOPO?? -replex 400 -hrex -dlb no -maxh 24.0
+mpiexec -np 12 gmx_mpi_plumed mdrun -ntomp $OMP_NUM_THREADS -s topol.tpr -pme gpu -nb gpu -update cpu -bonded gpu -pin on -pinstride 1 -plumed plumed_allangles.dat -multidir TOPO? TOPO?? -replex 400 -hrex -dlb no -maxh 24.0
 
 echo quit | nvidia-cuda-mps-control
 

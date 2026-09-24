@@ -13,6 +13,8 @@ tmin=$3 #(Temp. of ground replica)
 tmax=$4 #(Temp. of highest replica)
 # build geometric progression
 mdpfile=$5 #(mdp file like in classical MD at ground temperature)
+index=$6
+
 list=$(
 awk -v n=$nrep \
         -v tmin=$tmin \
@@ -37,7 +39,7 @@ echo 'lambda', $lambda
   partial_tempering_pairs.sh $lambda < processed_m.top > topol$i.top
   # prepare tpr file
   # -maxwarn is often needed because box could be charged
-  gmx grompp -maxwarn 2 -o topol$i.tpr -f $mdpfile -p topol$i.top -n index.ndx -c $input
+  gmx grompp -maxwarn 2 -o topol$i.tpr -f $mdpfile -p topol$i.top -n $index -c $input
 done
 
 for((i=0;i<$nrep;i++))
@@ -45,7 +47,7 @@ do
 mkdir TOPO$i
 mv topol$i.top TOPO$i
 mv topol$i.tpr TOPO$i
-cp plumed_allangle.dat TOPO$i
+cp plumed_allangles.dat TOPO$i
 cp reference.pdb TOPO$i
 cd TOPO$i
 mv topol$i.tpr topol.tpr
