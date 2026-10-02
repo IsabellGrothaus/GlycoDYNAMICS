@@ -293,11 +293,6 @@ def run_command(
     if result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, command, result.stdout)
 
-
-def _gromacs_command(gmx_command: str, *args: str) -> list[str]:
-    return [gmx_command, *args]
-
-
 def preview_setup(name: str, config: Mapping[str, Any], *, repo_root: str | Path | None = None) -> None:
     """Print exactly what would be done without executing anything."""
     p = merge_config(config, name)
@@ -323,15 +318,11 @@ def preview_setup(name: str, config: Mapping[str, Any], *, repo_root: str | Path
     print("  " + ", ".join(f"{a}-{b} (type {t})" for (a, b), t in zip(p["label"], p["ltype"])))
     print("=" * 68)
 
-
-def setup_rest_rect(
+def glygen(
     name: str,
     config: Mapping[str, Any],
-    *,
     repo_root: str | Path | None = None,
     template_dir: str | Path | None = None,
-    gmx_command: str = "gmx",
-    gmx_mpi_command: str = "gmx_mpi",
     use_module_load: bool = False,
     dry_run: bool = False,
     force: bool = False,
@@ -362,10 +353,6 @@ def setup_rest_rect(
         prefix = "ml chem/GROMACS && "
     else:
         prefix = " "
-    def cluster_command(binary: str, *args: str) -> list[str]:
-        if use_module_load:
-            return ["bash", "-lc", prefix + " ".join([binary, *args])]
-        return [binary, *args]
 
     config_file_root = (
         Path(repo_root).expanduser().resolve()
@@ -416,155 +403,162 @@ def setup_rest_rect(
     if charmm_gui_dir.is_dir():
         print("✓ CHARMM-GUI directory detected")
         if min_equ_dir.is_dir():
-            print("✓ Minimisation/equilibration already performed:")
+            print("✓ Minimisation/equilibration already performed")
             if rest_rect_dir.is_dir():
-                print("✓ REST-RECT simulation already setup:")
+                print("✓ REST-RECT simulation already setup")
                 if analysis_dir.is_dir():
-                    print("✓ Analysis already performed:")
+                    print("✓ Analysis already performed")
                 else:
-                    print("✗ Analysis not yet performed:")
+                    print("✗ Analysis not yet performed")
                     #to be continued!
             else:
-                print("✗ REST-RECT simulation not yet setup:")
-                log_file = sim_path / "rest_rect_setup.log"
-                if not dry_run:
-                    for filename in [
-                    "production.mdp",
-                    "job.sh",
-                    "partial_tempering_pairs.sh",
-                    "generate_HREMD.sh"
-                    ]:
-                        shutil.copy2(
-                            template_dir / filename,
-                            sim_path / filename,
-                        )
-                    with log_file.open("a") as fh:
-                        fh.write(f"\n=== {datetime.now(timezone.utc).isoformat()} | {name} ===\n")
-                        fh.write(json.dumps(p, indent=2, default=str) + "\n")
-
-                files_to_check = ["plumed_allangles.dat", "reference.pdb", "processed.top", "processed_m.top"]
-                if not dry_run:
-                    check_and_delete_files_and_directories(sim_path, files_to_check)
-
-                structure_file = min_equ_dir / p["structure_file"]
-                index_file = min_equ_dir/ "index.ndx"
-                topol_file = min_equ_dir/ "topol.top"
-
-                run_command(cluster_command(gmx_command, "editconf", "-f", str(structure_file.relative_to(sim_path)),
-                    "-o", "reference.pdb", "-resnr", "1"),
-                    sim_path, dry_run=dry_run, log_file=log_file)
-
-                if not dry_run:
-                    write_plumed(
-                        "plumed_allangles.dat",
-                        p["peptide"],
-                        p["label"],
-                        p["ltype"],
-                        p["carbon_t"],
-                        p["carbon_p"],
-                        str(sim_path)
-                    )
-
-                run_command(cluster_command(gmx_command, "grompp", "-f", p["mdp_file"],
-                    "-c", str(structure_file.relative_to(sim_path)), "-pp", "processed.top", "-n", str(index_file.relative_to(sim_path)), "-p", str(topol_file.relative_to(sim_path))),
-                    sim_path, dry_run=dry_run, log_file=log_file)
-
-                if not dry_run:
-                    define_solute(",".join(p["monosaccharide_types"]), str(sim_path))
-
-                run_command(["bash", "./generate_HREMD.sh", str(structure_file.relative_to(sim_path)), str(p["n_replica"]),
-                             str(p["min_temperature"]), str(p["max_temperature"]), p["mdp_file"], str(index_file.relative_to(sim_path))],
-                            sim_path, dry_run=dry_run, log_file=log_file)
-
-                _organize_output(sim_path, dry_run=dry_run)
-
-                if not dry_run:
-                    _write_metadata(sim_path, name, p)
-
-                print(f"\nCompleted: {name}")
-                return sim_path
+                _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run)
         else:
-            print("✗ Minimisation/equilibration not yet performed:")
-            if not gromacs_dir.is_dir():
-                raise SetupError(
-                    f"CHARMM-GUI gromacs directory not found: {gromacs_dir}"
-                )
-            if not dry_run:
-                shutil.copytree(
-                    gromacs_dir,
-                    sim_path,
-                    dirs_exist_ok=True,
-                )
-
-            log_file = sim_path / "rest_rect_setup.log"
-            if not dry_run:
-                for filename in [
-                    "step4.0_minimization.mdp",
-                    "step4.1_equilibration.mdp",
-                    "step5_production.mdp",
-                ]:
-                    shutil.copy2(
-                        template_dir / filename,
-                        sim_path / filename,
-                    )
-                with log_file.open("a") as fh:
-                    fh.write(f"\n=== {datetime.now(timezone.utc).isoformat()} | {name} ===\n")
-                    fh.write(json.dumps(p, indent=2, default=str) + "\n")
-
-            # Optional Neu5Ac force-field edit from the original notebook.
-            if p.get("modify_forcefield_for_neu5ac", False) and not dry_run:
-                remove_lines_and_insert(sim_path, p.get("forcefield_file", "toppar/forcefield.itp"))
-            if dry_run:
-                print(f"\n--- {name}: dry run ---")
-
-            run_command(cluster_command(gmx_command,
-                "grompp", "-f", "step4.0_minimization.mdp", "-o", "step4.0_minimization.tpr",
-                "-c", "step3_input.gro", "-r", "step3_input.gro", "-p", "topol.top", "-n", "index.ndx"),
-                sim_path, dry_run=dry_run, log_file=log_file)
-            run_command(cluster_command(gmx_mpi_command, "mdrun", "-deffnm", "step4.0_minimization"),
-                sim_path, dry_run=dry_run, log_file=log_file)
-        
-            run_command(cluster_command(gmx_command,
-                "grompp", "-f", "step4.1_equilibration.mdp", "-o", "step4.1_equilibration.tpr",
-                "-c", "step4.0_minimization.gro", "-r", "step4.0_minimization.gro",
-                "-p", "topol.top", "-n", "index.ndx"),
-                sim_path, dry_run=dry_run, log_file=log_file)
-            run_command(cluster_command(gmx_mpi_command, "mdrun", "-deffnm", "step4.1_equilibration"),
-                sim_path, dry_run=dry_run, log_file=log_file)
-        
-            run_command(cluster_command(gmx_command,
-                "grompp", "-f", "step5_production.mdp", "-o", "step5_production.tpr",
-                "-c", "step4.1_equilibration.gro", "-r", "step4.1_equilibration.gro",
-                "-p", "topol.top", "-n", "index.ndx"),
-                sim_path, dry_run=dry_run, log_file=log_file)
-            run_command(cluster_command(gmx_mpi_command, "mdrun", "-deffnm", "step5_production"),
-                sim_path, dry_run=dry_run, log_file=log_file)
-
-            min_equ = sim_path / "01_min_equ"
-            if not dry_run:
-                    min_equ.mkdir(exist_ok=True)
-            min_equ_names = [
-            "step3_input.gro","step3_input.pdb","step3_input.psf",
-            "step4.0_minimization.mdp", "step4.0_minimization.tpr", "step4.0_minimization.gro",
-            "step4.0_minimization.edr", "step4.0_minimization.log", "step4.0_minimization.mdp",
-            "step4.0_minimization.trr",
-            "step4.1_equilibration.mdp", "step4.1_equilibration.tpr", "step4.1_equilibration.gro",
-            "step4.1_equilibration.edr", "step4.1_equilibration.log", "step4.1_equilibration.cpt",
-            "step4.1_equilibration.xtc",
-            "step5_production.mdp", "step5_production.tpr", "step5_production.gro",
-            "step5_production.edr", "step5_production.log", "step5_production.cpt", "step5_production.xtc",
-            "topol.top", "topol.tpr", "toppar", "index.ndx"
-            ]
-
-            for name in min_equ_names:
-                src = sim_path / name
-                if src.exists():
-                    if dry_run:
-                        print(f"MOVE {src.name} -> 01_min_equ/")
-                    else:
-                        shutil.move(str(src), str(min_equ / src.name))
+            _perform_min_equ(gromacs_dir, sim_path, template_dir, p, dry_run)
+            _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run)
     else:
         print("✗ CHARMM-GUI directory not present")
+
+def _cluster_command(binary: str, *args: str) -> list[str]:
+    return ["bash", "-lc", " ".join([binary, *args])]
+    
+    return [binary, *args]
+def _perform_min_equ(gromacs_dir: Path, sim_path: Path, template_dir: Path, p: dict, dry_run: bool = False):
+    print("✗ Minimisation/equilibration not yet performed")
+    if not gromacs_dir.is_dir():
+        raise SetupError(
+            f"CHARMM-GUI gromacs directory not found: {gromacs_dir}"
+        )
+    if not dry_run:
+        shutil.copytree(
+            gromacs_dir,
+            sim_path,
+            dirs_exist_ok=True,
+        )
+    log_file = sim_path / "rest_rect_setup.log"
+    
+    if not dry_run:
+        for filename in [
+            "step4.0_minimization.mdp",
+            "step4.1_equilibration.mdp",
+            "step5_production.mdp",
+        ]:
+            shutil.copy2(
+                template_dir / filename,
+                sim_path / filename,
+            )
+        with log_file.open("a") as fh:
+            fh.write(f"\n=== {datetime.now(timezone.utc).isoformat()} | {name} ===\n")
+            fh.write(json.dumps(p, indent=2, default=str) + "\n")
+    # Optional Neu5Ac force-field edit from the original notebook.
+    if p.get("modify_forcefield_for_neu5ac", False) and not dry_run:
+        remove_lines_and_insert(sim_path, p.get("forcefield_file", "toppar/forcefield.itp"))
+    if dry_run:
+        print(f"\n--- {name}: dry run ---")
+    run_command(_cluster_command("gmx",
+        "grompp", "-f", "step4.0_minimization.mdp", "-o", "step4.0_minimization.tpr",
+        "-c", "step3_input.gro", "-r", "step3_input.gro", "-p", "topol.top", "-n", "index.ndx"),
+        sim_path, dry_run=dry_run, log_file=log_file)
+    run_command(_cluster_command("gmx_mpi", "mdrun", "-deffnm", "step4.0_minimization"),
+        sim_path, dry_run=dry_run, log_file=log_file)
+
+    run_command(_cluster_command("gmx",
+        "grompp", "-f", "step4.1_equilibration.mdp", "-o", "step4.1_equilibration.tpr",
+        "-c", "step4.0_minimization.gro", "-r", "step4.0_minimization.gro",
+        "-p", "topol.top", "-n", "index.ndx"),
+        sim_path, dry_run=dry_run, log_file=log_file)
+    run_command(_cluster_command("gmx_mpi", "mdrun", "-deffnm", "step4.1_equilibration"),
+        sim_path, dry_run=dry_run, log_file=log_file)
+
+    run_command(_cluster_command("gmx",
+        "grompp", "-f", "step5_production.mdp", "-o", "step5_production.tpr",
+        "-c", "step4.1_equilibration.gro", "-r", "step4.1_equilibration.gro",
+        "-p", "topol.top", "-n", "index.ndx"),
+        sim_path, dry_run=dry_run, log_file=log_file)
+    run_command(_cluster_command("gmx_mpi", "mdrun", "-deffnm", "step5_production"),
+        sim_path, dry_run=dry_run, log_file=log_file)
+    min_equ = sim_path / "01_min_equ"
+    if not dry_run:
+            min_equ.mkdir(exist_ok=True)
+    min_equ_names = [
+    "step3_input.gro","step3_input.pdb","step3_input.psf",
+    "step4.0_minimization.mdp", "step4.0_minimization.tpr", "step4.0_minimization.gro",
+    "step4.0_minimization.edr", "step4.0_minimization.log", "step4.0_minimization.mdp",
+    "step4.0_minimization.trr",
+    "step4.1_equilibration.mdp", "step4.1_equilibration.tpr", "step4.1_equilibration.gro",
+    "step4.1_equilibration.edr", "step4.1_equilibration.log", "step4.1_equilibration.cpt",
+    "step4.1_equilibration.xtc",
+    "step5_production.mdp", "step5_production.tpr", "step5_production.gro",
+    "step5_production.edr", "step5_production.log", "step5_production.cpt", "step5_production.xtc",
+    "topol.top", "topol.tpr", "toppar", "index.ndx"
+    ]
+    for name in min_equ_names:
+        src = sim_path / name
+        if src.exists():
+            if dry_run:
+                print(f"MOVE {src.name} -> 01_min_equ/")
+            else:
+                shutil.move(str(src), str(min_equ / src.name))
+
+def _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run):
+    print("✗ REST-RECT simulation not yet setup:")
+    log_file = sim_path / "rest_rect_setup.log"
+    if not dry_run:
+        for filename in [
+        "production.mdp",
+        "job.sh",
+        "partial_tempering_pairs.sh",
+        "generate_HREMD.sh"
+        ]:
+            shutil.copy2(
+                template_dir / filename,
+                sim_path / filename,
+            )
+        with log_file.open("a") as fh:
+            fh.write(f"\n=== {datetime.now(timezone.utc).isoformat()} | {name} ===\n")
+            fh.write(json.dumps(p, indent=2, default=str) + "\n")
+
+    files_to_check = ["plumed_allangles.dat", "reference.pdb", "processed.top", "processed_m.top"]
+    if not dry_run:
+        check_and_delete_files_and_directories(sim_path, files_to_check)
+
+    structure_file = min_equ_dir / p["structure_file"]
+    index_file = min_equ_dir/ "index.ndx"
+    topol_file = min_equ_dir/ "topol.top"
+
+    run_command(_cluster_command("gmx", "editconf", "-f", str(structure_file.relative_to(sim_path)),
+        "-o", "reference.pdb", "-resnr", "1"),
+        sim_path, dry_run=dry_run, log_file=log_file)
+
+    if not dry_run:
+        write_plumed(
+            "plumed_allangles.dat",
+            p["peptide"],
+            p["label"],
+            p["ltype"],
+            p["carbon_t"],
+            p["carbon_p"],
+            str(sim_path)
+        )
+
+    run_command(_cluster_command("gmx", "grompp", "-f", p["mdp_file"],
+        "-c", str(structure_file.relative_to(sim_path)), "-pp", "processed.top", "-n", str(index_file.relative_to(sim_path)), "-p", str(topol_file.relative_to(sim_path))),
+        sim_path, dry_run=dry_run, log_file=log_file)
+
+    if not dry_run:
+        define_solute(",".join(p["monosaccharide_types"]), str(sim_path))
+
+    run_command(["bash", "./generate_HREMD.sh", str(structure_file.relative_to(sim_path)), str(p["n_replica"]),
+                 str(p["min_temperature"]), str(p["max_temperature"]), p["mdp_file"], str(index_file.relative_to(sim_path))],
+                sim_path, dry_run=dry_run, log_file=log_file)
+
+    _organize_output(sim_path, dry_run=dry_run)
+
+    if not dry_run:
+        _write_metadata(sim_path, name, p)
+
+    print(f"\nCompleted: {name}")
+    return sim_path
 
 def _organize_output(sim_path: Path, *, dry_run: bool = False) -> None:
     """Organise files exactly once, without destructive wildcard deletes."""
@@ -624,7 +618,7 @@ __all__ = [
     "available_glycans",
     "overview_dataframe",
     "preview_setup",
-    "setup_rest_rect",
+    "glygen",
     "run_command",
 ]
 
