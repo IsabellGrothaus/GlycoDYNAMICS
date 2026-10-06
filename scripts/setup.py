@@ -23,13 +23,15 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-
 import yaml
-
+import MDAnalysis as mda
+from MDAnalysis.analysis import align
+import MDAnalysis.transformations as trans
+import plumed
+import re
 
 class SetupError(RuntimeError):
     """Raised when a REST-RECT setup cannot be completed safely."""
-
 
 def load_config(config_file: str | Path) -> dict[str, Any]:
     """Load the YAML configuration."""
@@ -242,21 +244,6 @@ def _resolve_simulation_path(repo_root: Path, configured_path: str | Path) -> Pa
     # The paths in the original notebook were relative to the notebook/repo root.
     return (repo_root / p).resolve()
 
-
-#def _copy_template_files(template_dir: Path, destination: Path, patterns: Iterable[str]) -> list[Path]:
-#    copied = []
-#    for pattern in patterns:
-#        matches = list(template_dir.glob(pattern))
-#        if not matches:
-#            raise SetupError(f"No template matched '{pattern}' in {template_dir}")
-#        for source in matches:
-#            if source.is_file():
-#                target = destination / source.name
-#                shutil.copy2(source, target)
-#                copied.append(target)
-#    return copied
-
-
 def run_command(
     command: list[str],
     cwd: Path,
@@ -399,6 +386,7 @@ def glygen(
     min_equ_dir = sim_path / "01_min_equ"
     rest_rect_dir = sim_path / "02_REST-RECT"
     analysis_dir = sim_path / "03_gl_data"
+    topo0 = rest_rect_dir / "TOPO0"
     
     if charmm_gui_dir.is_dir():
         print("✓ CHARMM-GUI directory detected")
@@ -410,7 +398,36 @@ def glygen(
                     print("✓ Analysis already performed")
                 else:
                     print("✗ Analysis not yet performed")
-                    #to be continued!
+                    
+                    analysis_dir.mkdir(exist_ok=True)
+                    
+                    _extract_replica_exchange_statistics(p, rest_rect_dir, sim_path)
+                    _subsample_align_trajectory(prefix, topo0, analysis_dir, sim_path)
+                    _generate_colvar_info(topo0, analysis_dir)
+
+                    hills_files = sorted(Path(topo0).glob("HILLS_*"))
+                    num_hills = len(hills_files)
+                    if num_hills == 0:
+                        raise FileNotFoundError("No HILLS files found in TOPO0.")
+
+                    columns = list(range(2, num_hills + 2))
+                    for hills_file, column in zip(hills_files, columns):
+                        suffix = hills_file.name.removeprefix("HILLS_")
+                        fes_dir = f"FES_{suffix}_1D".replace(".", "_")
+                        if fes_dir.is_dir():
+                            shutil.rmtree(fes_dir)
+                        fes_dir.mkdir()
+                        _calculate_fes(topo0, hills_file, fes_dir)
+                    
+                        source = fes_dir / "profiles" / "MIN2ZERO" / "fes_00500.dat"
+
+                        if source.is_file():
+                            fes_name = fes_dir.name.removeprefix("FES_")
+                            destination = analysis_dir / f"fes_{fes_name}.dat"
+                            shutil.copy2(source, destination)
+                        else:
+                            print(f"File not found: {source}")
+
             else:
                 _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run)
         else:
@@ -418,6 +435,174 @@ def glygen(
             _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run)
     else:
         print("✗ CHARMM-GUI directory not present")
+
+def _extract_replica_exchange_statistics(p, rest_rect_dir, sim_path):
+    md_log = Path(rest_rect_dir, "TOPO0", "md.log")
+    output_file = Path(sim_path, "rest_rect_setup.log")
+    #demux
+    subprocess.run(
+        ["helper/demux.pl", str(md_log)],
+        check=True
+    )
+    #check exchange probability
+    lines = md_log.read_text().splitlines()
+
+    for i, line in enumerate(lines):
+        if "Replica exchange statistics" in line:
+            with output_file.open("a") as f:
+                f.write("\n".join(lines[i:i + p["n_replica"]]) + "\n")
+            break
+    #rtt implementation still missing
+
+def _subsample_align_trajectory(prefix, topo0, analysis_dir, sim_path):
+    log_file = sim_path / "rest_rect_setup.log"
+    run_command(_cluster_command(prefix, "echo", "0", "|" ,"gmx",
+            "editconf", "-f", "reference.pdb", "-o", "reference_rest-rect.pdb",
+            "-n", "../../01_min_equ/index.ndx"),
+            topo0, log_file=log_file)
+    run_command(_cluster_command(prefix, "echo", "0", "|" ,"gmx",
+            "trjconv", "-f", "traj_comp.xtc", "-o", "conformations_rest-rect.xtc",
+            "-skip", "5", "-n", "../../01_min_equ/index.ndx"),
+            topo0, log_file=log_file)
+    
+    # Load the topology and trajectory files (with bonds!)
+    pdb_file = topo0 / "reference_rest-rect.pdb"
+    xtc_file = topo0 / "conformations_rest-rect.xtc"
+    xtc_aligned_file = topo0 / "conformations_rest-rect_aligned.xtc"
+
+    u = mda.Universe(pdb_file, xtc_file, guess_bonds=True)
+    # Selection used for centering/alignment reference (residues 1-3)
+    align_selection = u.select_atoms("resid 1 or resid 2 or resid 3")
+
+    # Whole system: amino acids + glycan
+    all_atoms = u.atoms
+
+    # Unwrap the whole system so the glycan is made whole (no PBC splitting),
+    # then center the box on residues 1-3 WITHOUT re-wrapping
+    # (re-wrapping after unwrap would just split it again)
+    unwrap_transformation = trans.unwrap(all_atoms)
+    center_transformation = trans.center_in_box(align_selection, wrap=False)
+
+    # Add transformations to the Universe trajectory
+    u.trajectory.add_transformations(unwrap_transformation, center_transformation)
+
+    # Align all frames to the first frame based on residues 1-3 only,
+    # but the whole system moves with the rotation/translation
+    aligner = align.AlignTraj(u, u, select="resid 1 or resid 2 or resid 3", in_memory=True)
+    aligner.run()
+
+    # Write the aligned trajectory (whole system) to a file
+    with mda.Writer(xtc_aligned_file, n_atoms=u.atoms.n_atoms) as writer:
+        for ts in u.trajectory:
+            writer.write(u.atoms)
+
+    shutil.copy2(pdb_file, analysis_dir)
+    shutil.copy2(xtc_aligned, analysis_dir)
+
+def _calculate_fes(topo0, hills_file, fes_dir):  
+    hill = topo0 / hills_file
+    subprocess.run(
+        [   "ml chem/PLUMED && "
+            "plumed",
+            "sum_hills",
+            "--hills", str(hill),
+            "--stride", 1000,
+            "--kt", "2.579",
+            "--bin", "99",
+            "--min", "0",
+            "--max", "0.5"
+        ],
+        check=True,
+    )
+
+    # Move generated fes* files into FES/
+    for fes_file in Path(topo0).glob("fes*"):
+        shutil.move(str(fes_file), fes_dir)
+
+    profiles_dir = fes_dir / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    for dat_file in fes_dir.glob("*_*.dat"):
+        shutil.move(str(dat_file), profiles_dir / dat_file.name)
+
+    for ii, fes_file in enumerate(sorted(profiles_dir.glob("fes_*.dat"))):
+        new_name = profiles_dir / f"fes_{ii:05d}.dat"
+
+        if fes_file != new_name:
+            fes_file.rename(new_name)
+
+    _shift_fes_to_zero(profiles_dir)
+    
+def _generate_colvar_info(topo0, analysis_dir):
+    colvar_file = topo0 / "COLVAR.0"
+    source_file_colvar = analysis_dir / "colvar.dat"
+    source_file_angles = analysis_dir / "angles.dat"
+    source_file_omega = analysis_dir / "omega_angles.dat"
+
+    colvar = plumed.read_as_pandas(colvar_file)
+    if "time" not in colvar.columns:
+        raise ValueError("The column 'time' is not found in the COLVAR file.")
+    pattern_phi_psi_omega = re.compile(r'^(phi|psi|omega)\d+')
+    filtered_columns_phi_psi_omega = [col for col in colvar.columns if pattern_phi_psi_omega.match(col)]
+    columns_to_save = ["time"] + filtered_columns_phi_psi_omega
+    filtered_data = colvar[columns_to_save]
+    filtered_data.to_csv(source_file_colvar, sep=" ", index=False)
+
+    header_line_phi_psi_omega = ' '.join(filtered_columns_phi_psi_omega)
+    with open(source_file_angles, "w") as file:
+        file.write(header_line_phi_psi_omega + "\n")
+
+    pattern_omega = re.compile(r'^(omega)\d+')
+    filtered_columns_omega = [col for col in colvar.columns if pattern_omega.match(col)]
+    header_line_omega = ' '.join(filtered_columns_omega)
+    with open(source_file_omega, "w") as file:
+        file.write(header_line_omega + "\n")
+
+def _shift_fes_to_zero(profiles_dir: Path):
+
+    profiles_dir = Path(profiles_dir)
+    output_dir = profiles_dir / "MIN2ZERO"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find and sort FES files
+    fes_files = sorted(profiles_dir.glob("fes*.dat"))
+
+    if not fes_files:
+        raise FileNotFoundError(
+            f"No FES files found in {profiles_dir}"
+        )
+
+    # Determine minimum free energy from the last FES file
+    with fes_files[-1].open("r") as file:
+        lines = file.readlines()[5:]
+
+    free_energies = [
+        float(line.split()[1])
+        for line in lines
+        if line.strip()
+    ]
+
+    minimum_fe = min(free_energies)
+
+    # Process every FES file
+    for fes_file in fes_files:
+
+        with fes_file.open("r") as file:
+            lines = file.readlines()[5:]
+
+        data = [
+            (float(line.split()[0]), float(line.split()[1]))
+            for line in lines
+            if line.strip()
+        ]
+
+        output_file = output_dir / fes_file.name
+
+        with output_file.open("w") as file:
+            for cv, fe in data:
+                shifted_fe = fe - minimum_fe
+                file.write(
+                    f"{cv:<14.9F}{shifted_fe:<14.9F}\n"
+                )
 
 def _cluster_command(binary: str, *args: str) -> list[str]:
     return ["bash", "-lc", " ".join([binary, *args])]
@@ -455,27 +640,27 @@ def _perform_min_equ(gromacs_dir: Path, sim_path: Path, template_dir: Path, p: d
         remove_lines_and_insert(sim_path, p.get("forcefield_file", "toppar/forcefield.itp"))
     if dry_run:
         print(f"\n--- {name}: dry run ---")
-    run_command(_cluster_command("gmx",
+    run_command(_cluster_command(prefix, "gmx",
         "grompp", "-f", "step4.0_minimization.mdp", "-o", "step4.0_minimization.tpr",
         "-c", "step3_input.gro", "-r", "step3_input.gro", "-p", "topol.top", "-n", "index.ndx"),
         sim_path, dry_run=dry_run, log_file=log_file)
-    run_command(_cluster_command("gmx_mpi", "mdrun", "-deffnm", "step4.0_minimization"),
+    run_command(_cluster_command(prefix, "gmx_mpi", "mdrun", "-deffnm", "step4.0_minimization"),
         sim_path, dry_run=dry_run, log_file=log_file)
 
-    run_command(_cluster_command("gmx",
+    run_command(_cluster_command(prefix, "gmx",
         "grompp", "-f", "step4.1_equilibration.mdp", "-o", "step4.1_equilibration.tpr",
         "-c", "step4.0_minimization.gro", "-r", "step4.0_minimization.gro",
         "-p", "topol.top", "-n", "index.ndx"),
         sim_path, dry_run=dry_run, log_file=log_file)
-    run_command(_cluster_command("gmx_mpi", "mdrun", "-deffnm", "step4.1_equilibration"),
+    run_command(_cluster_command(prefix, "gmx_mpi", "mdrun", "-deffnm", "step4.1_equilibration"),
         sim_path, dry_run=dry_run, log_file=log_file)
 
-    run_command(_cluster_command("gmx",
+    run_command(_cluster_command(prefix, "gmx",
         "grompp", "-f", "step5_production.mdp", "-o", "step5_production.tpr",
         "-c", "step4.1_equilibration.gro", "-r", "step4.1_equilibration.gro",
         "-p", "topol.top", "-n", "index.ndx"),
         sim_path, dry_run=dry_run, log_file=log_file)
-    run_command(_cluster_command("gmx_mpi", "mdrun", "-deffnm", "step5_production"),
+    run_command(_cluster_command(prefix, "gmx_mpi", "mdrun", "-deffnm", "step5_production"),
         sim_path, dry_run=dry_run, log_file=log_file)
     min_equ = sim_path / "01_min_equ"
     if not dry_run:
@@ -526,7 +711,7 @@ def _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run):
     index_file = min_equ_dir/ "index.ndx"
     topol_file = min_equ_dir/ "topol.top"
 
-    run_command(_cluster_command("gmx", "editconf", "-f", str(structure_file.relative_to(sim_path)),
+    run_command(_cluster_command(prefix, "gmx", "editconf", "-f", str(structure_file.relative_to(sim_path)),
         "-o", "reference.pdb", "-resnr", "1"),
         sim_path, dry_run=dry_run, log_file=log_file)
 
@@ -541,7 +726,7 @@ def _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run):
             str(sim_path)
         )
 
-    run_command(_cluster_command("gmx", "grompp", "-f", p["mdp_file"],
+    run_command(_cluster_command(prefix, "gmx", "grompp", "-f", p["mdp_file"],
         "-c", str(structure_file.relative_to(sim_path)), "-pp", "processed.top", "-n", str(index_file.relative_to(sim_path)), "-p", str(topol_file.relative_to(sim_path))),
         sim_path, dry_run=dry_run, log_file=log_file)
 
