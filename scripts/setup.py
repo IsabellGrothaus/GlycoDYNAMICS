@@ -311,8 +311,7 @@ def glygen(
     repo_root: str | Path | None = None,
     template_dir: str | Path | None = None,
     use_module_load: bool = False,
-    dry_run: bool = False,
-    force: bool = False,
+    dry_run: bool = False
 ) -> Path:
     """Run the complete setup for one configured glycan.
 
@@ -398,35 +397,36 @@ def glygen(
                     print("✓ Analysis already performed")
                 else:
                     print("✗ Analysis not yet performed")
-                    
-                    analysis_dir.mkdir(exist_ok=True)
-                    
-                    _extract_replica_exchange_statistics(p, rest_rect_dir, sim_path)
-                    _subsample_align_trajectory(prefix, topo0, analysis_dir, sim_path)
-                    _generate_colvar_info(topo0, analysis_dir)
 
-                    hills_files = sorted(Path(topo0).glob("HILLS_*"))
-                    num_hills = len(hills_files)
-                    if num_hills == 0:
-                        raise FileNotFoundError("No HILLS files found in TOPO0.")
-
-                    columns = list(range(2, num_hills + 2))
-                    for hills_file, column in zip(hills_files, columns):
-                        suffix = hills_file.name.removeprefix("HILLS_")
-                        fes_dir = f"FES_{suffix}_1D".replace(".", "_")
-                        if fes_dir.is_dir():
-                            shutil.rmtree(fes_dir)
-                        fes_dir.mkdir()
-                        _calculate_fes(topo0, hills_file, fes_dir)
+                    if not dry_run:
+                        analysis_dir.mkdir(exist_ok=True)
                     
-                        source = fes_dir / "profiles" / "MIN2ZERO" / "fes_00500.dat"
+                        _extract_replica_exchange_statistics(p, rest_rect_dir, sim_path)
+                        _subsample_align_trajectory(prefix, topo0, analysis_dir, sim_path)
+                        _generate_colvar_info(topo0, analysis_dir)
 
-                        if source.is_file():
-                            fes_name = fes_dir.name.removeprefix("FES_")
-                            destination = analysis_dir / f"fes_{fes_name}.dat"
-                            shutil.copy2(source, destination)
-                        else:
-                            print(f"File not found: {source}")
+                        hills_files = sorted(Path(topo0).glob("HILLS_*"))
+                        num_hills = len(hills_files)
+                        if num_hills == 0:
+                            raise FileNotFoundError("No HILLS files found in TOPO0.")
+
+                        columns = list(range(2, num_hills + 2))
+                        for hills_file, column in zip(hills_files, columns):
+                            suffix = hills_file.name.removeprefix("HILLS_")
+                            fes_dir = analysis_dir / f"FES_{suffix}_1D".replace(".", "_")
+                            if fes_dir.is_dir():
+                                shutil.rmtree(fes_dir)
+                            fes_dir.mkdir()
+                            _calculate_fes(topo0, hills_file, fes_dir)
+                        
+                            source = fes_dir / "profiles" / "MIN2ZERO" / "fes_00500.dat"
+    
+                            if source.is_file():
+                                fes_name = fes_dir.name.removeprefix("FES_")
+                                destination = analysis_dir / f"fes_{fes_name}.dat"
+                                shutil.copy2(source, destination)
+                            else:
+                                print(f"File not found: {source}")
 
             else:
                 _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run)
@@ -444,6 +444,8 @@ def _extract_replica_exchange_statistics(p, rest_rect_dir, sim_path):
         ["helper/demux.pl", str(md_log)],
         check=True
     )
+    for filename in ["replica_index.xvg", "replica_temp.xvg"]:
+        Path(filename).replace(Path(rest_rect_dir) / filename)
     #check exchange probability
     lines = md_log.read_text().splitlines()
 
@@ -492,28 +494,35 @@ def _subsample_align_trajectory(prefix, topo0, analysis_dir, sim_path):
     aligner.run()
 
     # Write the aligned trajectory (whole system) to a file
-    with mda.Writer(xtc_aligned_file, n_atoms=u.atoms.n_atoms) as writer:
+    with mda.Writer(str(xtc_aligned_file), n_atoms=u.atoms.n_atoms) as writer:
         for ts in u.trajectory:
             writer.write(u.atoms)
 
     shutil.copy2(pdb_file, analysis_dir)
-    shutil.copy2(xtc_aligned, analysis_dir)
+    shutil.copy2(xtc_aligned_file, analysis_dir)
 
 def _calculate_fes(topo0, hills_file, fes_dir):  
-    hill = topo0 / hills_file
-    subprocess.run(
-        [   "ml chem/PLUMED && "
-            "plumed",
-            "sum_hills",
-            "--hills", str(hill),
-            "--stride", 1000,
-            "--kt", "2.579",
-            "--bin", "99",
-            "--min", "0",
-            "--max", "0.5"
-        ],
-        check=True,
+
+    topo0 = Path(topo0)
+    hills_file = Path(hills_file)
+    fes_dir = Path(fes_dir)
+
+    command = (
+    "ml chem/PLUMED && "
+    "plumed sum_hills "
+    f"--hills {hills_file.resolve()} "
+    "--stride 1000 "
+    "--kt 2.579 "
+    "--bin 99 "
+    "--min 0 "
+    "--max 0.5"
     )
+
+    subprocess.run(
+    ["bash", "-lc", command],
+    cwd=topo0,
+    check=True,
+    )   
 
     # Move generated fes* files into FES/
     for fes_file in Path(topo0).glob("fes*"):
@@ -534,18 +543,24 @@ def _calculate_fes(topo0, hills_file, fes_dir):
     
 def _generate_colvar_info(topo0, analysis_dir):
     colvar_file = topo0 / "COLVAR.0"
+    pucker_file = topo0 / "COLVAR_theta.0"
     source_file_colvar = analysis_dir / "colvar.dat"
     source_file_angles = analysis_dir / "angles.dat"
     source_file_omega = analysis_dir / "omega_angles.dat"
+    source_file_pucker = analysis_dir / "pucker.dat"
 
-    colvar = plumed.read_as_pandas(colvar_file)
-    if "time" not in colvar.columns:
-        raise ValueError("The column 'time' is not found in the COLVAR file.")
+    colvar = plumed.read_as_pandas(str(colvar_file))
     pattern_phi_psi_omega = re.compile(r'^(phi|psi|omega)\d+')
     filtered_columns_phi_psi_omega = [col for col in colvar.columns if pattern_phi_psi_omega.match(col)]
     columns_to_save = ["time"] + filtered_columns_phi_psi_omega
     filtered_data = colvar[columns_to_save]
     filtered_data.to_csv(source_file_colvar, sep=" ", index=False)
+
+    pucker = plumed.read_as_pandas(str(pucker_file))
+    filtered_columns_pucker = [col for col in pucker.columns if "theta" in col or "phi" in col]
+    columns_to_save = ["time"] + filtered_columns_pucker
+    filtered_data = pucker[columns_to_save]
+    filtered_data.to_csv(source_file_pucker, sep=" ", index=False)
 
     header_line_phi_psi_omega = ' '.join(filtered_columns_phi_psi_omega)
     with open(source_file_angles, "w") as file:
