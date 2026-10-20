@@ -1,15 +1,19 @@
-#!/bin/bash
+#!/bin/bash -l
+#SBATCH --gres=gpu:a100:4
 #SBATCH --time=24:00:00
-#SBATCH --partition=gpu-a100
-#SBATCH --gres=gpu:4
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=12
-#SBATCH --account=hbb00004
+#SBATCH --job-name=glycan
+#SBATCH --export=NONE
+
+#alex has 16 CPU per GPU
+#-np should be number of replicas
+#8 gpu per node
+#16 cpu per gpu
+#1 node per simulation
 
 unset SLURM_EXPORT_ENV
 
-module load gcc/11.3.0 cuda/11.8 openmpi/gcc.11/4.1.4
-module load gromacs/2022.5
+module purge
+module load gromacs/2022.5-gcc11.5.0-openmpi4-mkl-cuda-plumed2.8.3
 
 export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps.$SLURM_JOB_ID
 export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log.$SLURM_JOB_ID
@@ -20,10 +24,13 @@ export GMX_GPU_DD_COMMS=true
 export GMX_GPU_PME_PP_COMMS=true
 export GMX_GPU_FORCE_UPDATE_DEFAULT_GPU=true
 
-export OMP_NUM_THREADS=6
+#Production
+mpirun -np 12 gmx_mpi mdrun -s topol.tpr -pme gpu -nb gpu -update cpu -bonded gpu -pin on -pinstride 1 -plumed plumed_allangles.dat -multidir TOPO? TOPO?? -replex 400 -hrex -dlb no -maxh 24
 
-mpiexec -np 12 gmx_mpi_plumed mdrun -ntomp $OMP_NUM_THREADS -s topol.tpr -pme gpu -nb gpu -update cpu -bonded gpu -pin on -pinstride 1 -plumed plumed_allangles.dat -multidir TOPO? TOPO?? -replex 400 -hrex -dlb no -maxh 24.0
+#Restart
+#mpirun -np 12 gmx_mpi mdrun -cpi state.cpt -s topol.tpr -pme gpu -nb gpu -update cpu -bonded gpu -pin on -pinstride 1 -plumed plumed_allangles.dat -multidir TOPO? TOPO?? -replex 400 -hrex -dlb no -maxh 24
 
+# this will stop the MPS-server
 echo quit | nvidia-cuda-mps-control
 
 

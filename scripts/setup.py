@@ -109,6 +109,7 @@ def add_glycan_to_yaml(
     carbon_t: list[int],
     carbon_p: list[int],
     *,
+    modify_forcefield_for_neu5ac: bool = False,
     monosaccharide_types: list[str] | str | None = None,
     peptide: str | None = None,
     n_replica: int | None = None,
@@ -157,6 +158,7 @@ def add_glycan_to_yaml(
     }
 
     optional = {
+        "modify_forcefield_for_neu5ac": modify_forcefield_for_neu5ac,
         "monosaccharide_types": monosaccharide_types,
         "peptide": peptide,
         "n_replica": n_replica,
