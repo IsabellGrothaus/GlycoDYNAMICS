@@ -16,6 +16,7 @@ The glycan directory hierarchy relative to ``data_path`` is retained.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,162 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+TORSION_RE = re.compile(r"^(phi|psi|omega(?:7|8|9)?)(?:_)?(\d+)_(\d+)$", re.I)
+
+
+def _colvar_columns(path: Path) -> tuple[list[str], int | None, list[str]]:
+    """Read PLUMED #! FIELDS or plain column headers without loading trajectories."""
+    warnings: list[str] = []
+    if not path.is_file():
+        return [], None, ["colvar.dat missing"]
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        first = next((line.strip() for line in handle if line.strip()), "")
+    if not first:
+        return [], 0, ["colvar.dat is empty"]
+    if first.startswith("#! FIELDS"):
+        columns = first.split()[2:]
+        # PLUMED data rows are left untouched; count with streaming iteration.
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            count = sum(bool(line.strip()) and not line.lstrip().startswith("#") for line in handle)
+    elif first.startswith("#"):
+        return [], None, ["COLVAR header not recognized; expected '#! FIELDS' or a plain header"]
+    else:
+        columns = first.split()
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            count = sum(bool(line.strip()) and not line.lstrip().startswith("#") for line in handle) - 1
+    if len(set(columns)) != len(columns):
+        warnings.append("Duplicate column names in colvar.dat")
+    if "time" not in columns:
+        warnings.append("colvar.dat has no time column")
+    return columns, count, warnings
+
+
+def register_glycan(glycan_directory: str | Path) -> dict[str, Any]:
+    """Register actual library files into glycan_id.json, without changing graph IDs.
+
+    A torsion named phi1_2 maps to fes_phi1_2_0.dat (likewise for omega).
+
+    No canonicalization or simulation is performed. Existing graph ordering is used.
+    Missing files produce explicit warnings, never fabricated successful validation.
+    """
+    folder = Path(glycan_directory).expanduser().resolve()
+    glycan_id = folder.name
+    json_path = folder / f"{glycan_id}.json"
+    if not json_path.is_file():
+        raise FileNotFoundError(json_path)
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Metadata must be a JSON object: {json_path}")
+    edges = data.get("graph_edges", [])
+    if not isinstance(edges, list):
+        raise ValueError(f"graph_edges must be a list in {json_path}")
+    edge_map = {}
+    warnings = []
+    for edge in edges:
+        parent, child = str(edge["parent"]), str(edge["child"])
+        edge_id = f"{parent}_{child}"
+        if "id" in edge and str(edge["id"]) != edge_id:
+            warnings.append(f"Edge ID mismatch: {edge['id']} != {edge_id}")
+        if edge_id in edge_map:
+            warnings.append(f"Duplicate edge: {edge_id}")
+        edge_map[edge_id] = edge
+
+    columns, frame_count, parse_warnings = _colvar_columns(folder / "colvar.dat")
+    warnings.extend(parse_warnings)
+    actual = {p.name for p in folder.iterdir() if p.is_file()}
+    torsions = []
+    for name in columns:
+        match = TORSION_RE.fullmatch(name)
+        if not match:
+            continue
+        torsion_type, parent, child = match.groups()
+        edge_id = f"{parent}_{child}"
+        if edge_id not in edge_map:
+            warnings.append(f"COLVAR torsion {name} does not match any graph edge")
+            continue
+        # Production FES files carry a replica/index suffix (_0). Preserve it.
+        fes = f"fes_{name}_0.dat"
+        if fes not in actual:
+            warnings.append(f"Missing FES for {name}: {fes}")
+        torsions.append({
+            "id": len(torsions), "name": name, "type": torsion_type.lower(),
+            "edge_id": edge_id, "colvar_column": name,
+            "fes_file": fes if fes in actual else None,
+        })
+
+    torsion_names = {item["name"] for item in torsions}
+    for edge_id, edge in edge_map.items():
+        for prefix in ("phi", "psi"):
+            required = f"{prefix}{edge_id}"
+            if required not in torsion_names and columns:
+                warnings.append(f"Missing COLVAR torsion: {required}")
+        linkage = str(edge.get("linkage", ""))
+        if linkage.endswith("-6") and not any(
+            t["edge_id"] == edge_id and t["type"] == "omega" for t in torsions
+        ) and columns:
+            warnings.append(f"Missing omega torsion for 1-6 linkage {edge_id}")
+        if linkage.lower().endswith("2-8") and columns:
+            for omega in ("omega7", "omega8", "omega9"):
+                if not any(t["edge_id"] == edge_id and t["type"] == omega for t in torsions):
+                    warnings.append(f"Missing {omega} for 2-8 linkage {edge_id}")
+
+    expected_torsions = None
+    if columns:
+        expected_torsions = 2 * len(edge_map) + sum(
+            1 if str(e.get("linkage", "")).endswith("-6") else
+            3 if str(e.get("linkage", "")).lower().endswith("2-8") else 0
+            for e in edges
+        )
+    matching = (bool(columns) and len(torsions) == expected_torsions
+                and not any("Missing COLVAR torsion" in w or "Missing omega" in w or "does not match" in w
+                            for w in warnings))
+    all_fes = bool(torsions) and all(t["fes_file"] for t in torsions)
+    xtcs = sorted(n for n in actual if n.endswith(".xtc"))
+    pdbs = sorted(n for n in actual if n.endswith(".pdb"))
+    if not xtcs:
+        warnings.append("No XTC trajectory found")
+    if not pdbs:
+        warnings.append("No PDB reference found")
+    if not (folder / "pucker.dat").is_file():
+        warnings.append("Missing pucker.dat")
+    if not (folder / "angles.dat").is_file():
+        warnings.append("Missing angles.dat")
+    if not (folder / "omega_angles.dat").is_file():
+        warnings.append("Missing omega_angles.dat")
+    if not columns and not edge_map:
+        status = "metadata_only"
+    elif not columns:
+        status = "awaiting_analysis"
+    elif (matching and all_fes and xtcs and pdbs and not parse_warnings
+          and all(n in actual for n in ("angles.dat", "omega_angles.dat", "pucker.dat"))):
+        status = "complete"
+    else:
+        status = "incomplete"
+    data["analysis"] = {
+        "schema_version": 1,
+        "status": status,
+        "files": {
+            "colvar": "colvar.dat" if "colvar.dat" in actual else None,
+            "angles": "angles.dat" if "angles.dat" in actual else None,
+            "omega_angles": "omega_angles.dat" if "omega_angles.dat" in actual else None,
+            "pucker": "pucker.dat" if "pucker.dat" in actual else None,
+            "trajectories": xtcs,
+            "references": pdbs,
+        },
+        "colvar_rows": frame_count,
+        "dihedrals": torsions,
+        "validation": {
+            "colvar_columns_match": matching if columns else None,
+            "fes_mapping_complete": all_fes if columns else None,
+            "trajectory_frames_match": None,
+            "conformer_states_match": None,
+        },
+        "warnings": sorted(set(warnings)),
+    }
+    _atomic_write_json(json_path, data)
+    return data["analysis"]
 
 
 def generate_glycan_json(database_path: str | Path) -> Path:
@@ -115,6 +272,9 @@ def generate_glycan_json(database_path: str | Path) -> Path:
             "user_checked": reconstruction.get("user_checked"),
             "files": files,
             "missing_files": missing,
+            "analysis_status": (data.get("analysis") or {}).get("status"),
+            "dihedral_count": len((data.get("analysis") or {}).get("dihedrals", [])),
+            "analysis_warnings": (data.get("analysis") or {}).get("warnings", []),
         }
         if not entry["iupac"]:
             issues.append(f"{relative.as_posix()}: missing IUPAC")
@@ -151,6 +311,8 @@ def display_glycan_library(database_path: str | Path, *, show_files: bool = Fals
         print(f"  IUPAC: {entry.get('iupac') or 'not available'}")
         print(f"  Reconstruction: {entry.get('reconstruction_status') or 'not recorded'}"
               f"; user checked: {entry.get('user_checked')}")
+        print(f"  Analysis: {entry.get('analysis_status') or 'not registered'}; "
+              f"dihedrals: {entry.get('dihedral_count', 0)}")
         if entry.get("missing_files"):
             print(f"  Missing: {', '.join(entry['missing_files'])}")
         if show_files:
@@ -232,12 +394,20 @@ def copy_glycan_library(
                     continue
                 shutil.copy2(source, target)
                 copied += 1
+            registration = register_glycan(destination)
+            print(f"  Registration: {registration['status']}; {len(registration['dihedrals'])} torsions")
             glycan_count += 1
             print(f"✓ {relative.as_posix()}: {len(unique_sources)} eligible files")
     finally:
-        # Always refresh from the actual destination contents, even if nothing copied.
+        # Re-register all existing destinations, including those not copied this run.
+        for metadata in sorted(library_dir.rglob("*.json")):
+            if metadata.parent.name == metadata.stem:
+                try:
+                    register_glycan(metadata.parent)
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    print(f"WARNING: could not register {metadata.parent}: {exc}")
         generate_glycan_json(library_dir)
     print(f"Finished: {copied} copied, {skipped} skipped, {glycan_count} glycan folders processed")
 
 
-__all__ = ["copy_glycan_library", "generate_glycan_json", "display_glycan_library"]
+__all__ = ["copy_glycan_library", "generate_glycan_json", "display_glycan_library", "register_glycan"]
