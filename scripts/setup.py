@@ -1,1079 +1,807 @@
-"""Reusable setup engine for the REST-RECT glycan workflow.
+"""GlycoGEN: per-glycan JSON driven, resumable CHARMM-GUI -> REST-RECT workflow.
 
-The scientific operations intentionally follow the original notebooks:
-1. copy the required template files
-2. run minimization, equilibration and production preprocessing/runs
-3. create reference.pdb
-4. create plumed_allangles.dat using the existing setup_RESTRECT implementation
-5. create processed.top
-6. define the REST2 solute
-7. run generate_HREMD.sh
-8. organise the resulting files
+Public API
+----------
+    status(glycan_id, data_dir)
+    init_glycan_simulation()
+    generate_glycan_simulation(glycan_id, data_dir, template_dir, ...)
+    analyze_glycan(glycan_id, data_dir, ...)
 
-Some functions are working for the atom names of the CHARMM36m FF. Might need to be adapted for the AMBER FF family
+All chemical information is read from the unique <glycan_id>/<glycan_id>.json
+found recursively below data_dir.
+No config.yaml, metadata.yaml, label/ltype/carbon lists, or dry_run.
+
+Important: the user must run the generated REST-RECT jobs on the HPC separately.
+The analysis is only attempted after trajectory outputs have been downloaded.
 """
-
 from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
-from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
-import yaml
-import MDAnalysis as mda
-from MDAnalysis.analysis import align
-import MDAnalysis.transformations as trans
-import plumed
-import re
+
+
 
 class SetupError(RuntimeError):
-    """Raised when a REST-RECT setup cannot be completed safely."""
-
-def load_config(config_file: str | Path) -> dict[str, Any]:
-    """Load the YAML configuration."""
-    config_file = Path(config_file).expanduser().resolve()
-    if not config_file.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_file}")
-    with config_file.open() as fh:
-        config = yaml.safe_load(fh)
-    if not isinstance(config, dict) or "defaults" not in config or "glycans" not in config:
-        raise SetupError("YAML must contain 'defaults' and 'glycans'.")
-    return config
+    pass
 
 
-def merge_config(config: Mapping[str, Any], glycan_name: str) -> dict[str, Any]:
-    """Merge global defaults with glycan-specific settings."""
-    glycans = config.get("glycans", {})
-    if glycan_name not in glycans:
-        raise KeyError(f"Unknown glycan '{glycan_name}'. Available: {list(glycans)}")
-    params = deepcopy(dict(config["defaults"]))
-    params.update(deepcopy(dict(glycans[glycan_name])))
-    return params
+SIALIC_NAMES = {"Neu", "Neu5Ac", "Neu5Gc", "Kdn", "Kdo", "Sia", "Pse", "Leg", "Aci", "4eLeg"}
+# CHARMM-specific correction in the original setup.py is validated for Neu5Ac,
+# not for arbitrary nonulosonic acids.
+NEU5AC_NAMES = {"Neu5Ac"}
+REST_RECT_FACTORS = [1, 1.2, 1.46, 1.82, 2.3, 2.94, 3.78, 4.89, 6.34, 8.23, 10.7, 14]
+MIN_EQU_STEPS = (
+    ("step4.0_minimization", "step3_input.gro", "step3_input.gro"),
+    ("step4.1_equilibration", "step4.0_minimization.gro", "step4.0_minimization.gro"),
+    ("step5_production", "step4.1_equilibration.gro", "step4.1_equilibration.gro"),
+)
+
+def _log(path: Path, message: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now(timezone.utc).isoformat()}] {message}\n")
+    print(message)
 
 
-def validate_glycan_config(name: str, params: Mapping[str, Any]) -> list[str]:
-    """Return validation errors without touching the filesystem."""
-    errors: list[str] = []
-    required = ["path", "n_replica", "min_temperature", "max_temperature",
-                "structure_file", "mdp_file", "peptide", "label", "ltype",
-                "carbon_t", "carbon_p", "monosaccharide_types"]
-    for key in required:
-        if key not in params:
-            errors.append(f"{name}: missing '{key}'")
-
-    if errors:
-        return errors
-
-    n_links = len(params["label"])
-    for key in ("ltype", "carbon_t"):
-        if len(params[key]) != n_links:
-            errors.append(f"{name}: len({key})={len(params[key])} but len(label)={n_links}")
-
-    if len(params["carbon_p"]) < max(max(x) for x in params["label"]):
-        errors.append(
-            f"{name}: carbon_p has {len(params['carbon_p'])} entries but the highest residue label is "
-            f"{max(max(x) for x in params['label'])}"
-        )
-
-    if int(params["n_replica"]) < 2:
-        errors.append(f"{name}: n_replica must be >= 2")
-    if float(params["min_temperature"]) <= 0 or float(params["max_temperature"]) <= 0:
-        errors.append(f"{name}: temperatures must be positive")
-    if float(params["max_temperature"]) < float(params["min_temperature"]):
-        errors.append(f"{name}: max_temperature must be >= min_temperature")
-
-    return errors
+def _cmd(args, cwd: Path, log: Path, *, module: str | None = None, input_text: str | None = None):
+    args = [str(a) for a in args]
+    if module:
+        # bash -l makes environment modules available on sites that initialize
+        # them in login shells; module needs to exist at the target site.
+        actual = ["bash", "-lc", f"module load {shlex.quote(module)} && {shlex.join(args)}"]
+    else:
+        actual = args
+    _log(log, f"RUN: {shlex.join(actual)}")
+    result = subprocess.run(actual, cwd=cwd, input=input_text, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, check=False)
+    with log.open("a", encoding="utf-8") as f:
+        f.write(result.stdout or "")
+        f.write("\n")
+    if result.stdout:
+        print(result.stdout[-2500:])
+    if result.returncode:
+        raise SetupError(f"Command failed with exit code {result.returncode}: {shlex.join(actual)}. See {log}")
 
 
-def validate_config(config: Mapping[str, Any]) -> dict[str, list[str]]:
-    """Validate every configured glycan and return only systems with errors."""
-    problems = {}
-    for name in config["glycans"]:
-        errors = validate_glycan_config(name, merge_config(config, name))
-        if errors:
-            problems[name] = errors
-    return problems
+def find_glycan_directory(root: str | Path, glycan_id: str) -> Path:
+    """Find the unique glycan directory anywhere below the library root.
 
-
-
-def add_glycan_to_yaml(
-    config_file: str | Path,
-    name: str,
-    path: str | Path,
-    label: list[list[int]],
-    ltype: list[int],
-    carbon_t: list[int],
-    carbon_p: list[int],
-    *,
-    modify_forcefield_for_neu5ac: bool = False,
-    monosaccharide_types: list[str] | str | None = None,
-    peptide: str | None = None,
-    n_replica: int | None = None,
-    min_temperature: float | None = None,
-    max_temperature: float | None = None,
-    structure_file: str | None = None,
-    mdp_file: str | None = None,
-    overwrite: bool = False,
-) -> dict[str, Any]:
-    """Add one glycan definition to an existing YAML configuration.
-
-    Only parameters that differ from the global defaults need to be supplied.
-    The function validates the new glycan before writing the YAML file.
-
-    Example
-    -------
-    add_glycan_to_yaml(
-        "../config/glycans.yaml",
-        name="A2G2S2",
-        path="../C/A2G2S2/",
-        label=[[1, 2], [2, 3], [3, 4]],
-        ltype=[4, 4, 6],
-        carbon_t=[1, 1, 1],
-        carbon_p=[1, 1, 1, 1],
-    )
+    Accepts a direct glycan directory as ``root`` as well as the library root.
+    Directories are matched by their exact name, not by a substring; ambiguous
+    matches raise an error instead of silently selecting the wrong glycan.
     """
-    config_path = Path(config_file).expanduser().resolve()
-    config = load_config(config_path)
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"Glycan library directory not found: {root}")
+    if not glycan_id or glycan_id in (".", "..") or Path(glycan_id).name != glycan_id:
+        raise ValueError(f"Invalid glycan_id: {glycan_id!r}")
 
-    if name in config["glycans"] and not overwrite:
+    matches = []
+    if root.name == glycan_id:
+        matches.append(root)
+    # rglob searches all library branches, e.g. N-glycans/High-mannose/Man5.
+    matches.extend(p for p in root.rglob(glycan_id) if p.is_dir())
+    unique = sorted(set(matches))
+    if not unique:
+        raise FileNotFoundError(f"Glycan directory {glycan_id!r} not found under {root}")
+    if len(unique) > 1:
         raise SetupError(
-            f"Glycan '{name}' already exists. Use overwrite=True to replace it."
+            f"Multiple directories named {glycan_id!r} found under {root}: "
+            + ", ".join(str(path) for path in unique)
+        )
+    return unique[0]
+
+
+def _load(glycan_id: str, data_dir: str | Path):
+    folder = find_glycan_directory(data_dir, glycan_id)
+    source = folder / f"{glycan_id}.json"
+    if not source.is_file():
+        raise FileNotFoundError(f"Missing metadata: {source}")
+    data = json.loads(source.read_text(encoding="utf-8"))
+    if data.get("glycan_id") != glycan_id:
+        raise SetupError(f"glycan_id does not match filename: {source}")
+    for key in ("monosaccharides", "pdb_residues", "pucker_ring_atoms", "graph_edges", "simulation"):
+        if key not in data:
+            raise SetupError(f"{source}: missing {key!r}")
+    ids = set(data["monosaccharides"])
+    if ids != set(data["pdb_residues"]) or ids != set(data["pucker_ring_atoms"]):
+        raise SetupError("monosaccharides, pdb_residues and pucker_ring_atoms keys must match")
+    sim = data["simulation"]
+    for key in ("n_replica", "min_temperature", "max_temperature", "structure_file",
+                "mdp_file", "template_files", "forcefield_file"):
+        if key not in sim:
+            raise SetupError(f"{source}: missing simulation.{key}")
+    if int(sim["n_replica"]) < 2 or float(sim["min_temperature"]) <= 0 or float(sim["max_temperature"]) <= float(sim["min_temperature"]):
+        raise SetupError(f"{source}: invalid replica number or temperature range")
+    for e in data["graph_edges"]:
+        p, c = str(e["parent"]), str(e["child"])
+        if p not in ids or c not in ids or not re.fullmatch(r"[abAB][12]-\d+", str(e["linkage"])):
+            raise SetupError(f"Invalid graph edge: {e}")
+        donor = int(str(e["linkage"]).split("-")[0][1:])
+        sugar = data["monosaccharides"][c]
+        if (sugar in SIALIC_NAMES) != (donor == 2):
+            raise SetupError(f"Donor C{donor} inconsistent with child monosaccharide {sugar}: {e}")
+    return folder, data
+
+
+def _nonempty(p: Path) -> bool:
+    return p.is_file() and p.stat().st_size > 0
+
+
+def _charmm_gromacs(folder: Path) -> Path | None:
+    hits = sorted(p / "gromacs" for p in folder.glob("*charmm-gui*") if (p / "gromacs").is_dir())
+    if len(hits) > 1:
+        raise SetupError(f"Multiple CHARMM-GUI GROMACS directories: {hits}")
+    return hits[0] if hits else None
+
+
+def _min_done(folder: Path) -> bool:
+    directory = folder / "01_min_equ"
+    return all(_nonempty(directory / f"{step}.gro") and _nonempty(directory / f"{step}.log")
+               for step, _, _ in MIN_EQU_STEPS)
+
+
+def _plumed_missing_definitions(path: Path, data: dict) -> list[str]:
+    """Check expected glycosidic torsions and their METAD biases, not just file existence."""
+    if not _nonempty(path):
+        return ["PLUMED input missing"]
+    _, torsions = _torsion_definitions(data)
+    peptide_lines, peptide_torsions = _peptide_torsions(data)
+    text = path.read_text(encoding="utf-8")
+    definitions = set(re.findall(r"^([A-Za-z][\w]*):\s*TORSION\s", text, re.M))
+    biases = set(re.findall(r"^metaD_([A-Za-z][\w]*):\s*METAD\s", text, re.M))
+    expected = set(torsions + peptide_torsions)
+    return ([f"TORSION {name}" for name in sorted(expected - definitions)]
+            + [f"METAD {name}" for name in sorted(expected - biases)])
+
+
+def _validate_plumed_atoms(plumed: Path, pdb: Path):
+    """Ensure every @ATOM-RESID used by PLUMED occurs exactly once in reference PDB."""
+    if not pdb.is_file():
+        raise FileNotFoundError(pdb)
+    from collections import Counter
+    counts = Counter()
+    for line in pdb.open(encoding="utf-8", errors="replace"):
+        if line.startswith(("ATOM  ", "HETATM")):
+            try:
+                counts[(line[12:16].strip(), int(line[22:26]))] += 1
+            except ValueError:
+                continue
+    required = set((atom, int(resid)) for atom, resid in re.findall(
+        r"@([A-Za-z0-9]+)-(\d+)", plumed.read_text(encoding="utf-8")))
+    invalid = [(atom, resid, counts[(atom, resid)]) for atom, resid in sorted(required)
+               if counts[(atom, resid)] != 1]
+    if invalid:
+        raise SetupError(f"PLUMED atom references missing or ambiguous in {pdb}: {invalid[:20]}")
+
+
+def _rest_ready(folder: Path, data: dict) -> bool:
+    rest = folder / "02_REST-RECT"
+    n = int(data["simulation"]["n_replica"])
+    return (all(_nonempty(rest / x) for x in ("plumed_allangles.dat", "reference.pdb", "processed_m.top", "job.sh"))
+            and not _plumed_missing_definitions(rest / "plumed_allangles.dat", data)
+            and all((rest / f"TOPO{i}" / "topol.tpr").is_file() for i in range(n)))
+
+
+def _production_done(folder: Path, data: dict) -> bool:
+    rest = folder / "02_REST-RECT"
+    n = int(data["simulation"]["n_replica"])
+    return (_nonempty(rest / "TOPO0" / "md.log")
+            and _nonempty(rest / "TOPO0" / "COLVAR.0")
+            and _nonempty(rest / "TOPO0" / "traj_comp.xtc"))
+
+
+def _analysis_done(folder: Path, data: dict) -> bool:
+    out = folder / "03_lib"
+    hills = list((folder / "02_REST-RECT" / "TOPO0").glob("HILLS_*"))
+    expected = [out / f"fes_{h.name.removeprefix('HILLS_').replace('.', '_')}.dat" for h in hills]
+    return (bool(hills) and all(map(_nonempty, expected))
+            and all(_nonempty(out / f) for f in ("colvar.dat", "angles.dat", "omega_angles.dat",
+                                                 "conformations_rest-rect_aligned.xtc", "reference_rest-rect.pdb")))
+
+
+def status(glycan_id: str, data_dir: str | Path = "data") -> dict[str, bool]:
+    folder, data = _load(glycan_id, data_dir)
+    result = {
+        "charmm_gui": _charmm_gromacs(folder) is not None,
+        "min_equ": _min_done(folder),
+        "rest_rect_setup": _rest_ready(folder, data),
+        "rest_rect_production": _production_done(folder, data),
+        "analysis": _analysis_done(folder, data),
+    }
+    print(f"\n{glycan_id}: " + ", ".join(f"{k}={'✓' if v else '—'}" for k, v in result.items()))
+    return result
+
+
+def _copy_templates(source: Path, dest: Path, patterns: list[str], *, required: tuple[str, ...] = ()):
+    copied = set()
+    for pattern in patterns:
+        hits = [p for p in source.glob(pattern) if p.is_file()]
+        if not hits and not any(ch in pattern for ch in "*?[]"):
+            raise FileNotFoundError(source / pattern)
+        for item in hits:
+            shutil.copy2(item, dest / item.name)
+            copied.add(item.name)
+    for filename in required:
+        if not (dest / filename).is_file():
+            raise FileNotFoundError(f"Missing required template: {filename} (searched {source})")
+    return copied
+
+
+def _apply_neu5ac_correction(path: Path, log: Path):
+    """Apply original CHARMM36 Neu5Ac dihedral replacement once, and fail if source layout changes."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    text = path.read_text()
+    # Original correction was scoped to two specific atom-type patterns.
+    inserts = [
+        "  NC2D1  CC3161  CC3161  CC3261     9     0.000000     0.836800     3",
+        "  CC312  CC3163  CC3161   NC2D1     9     0.000000     0.836800     3",
+        " OC3C61  CC3163  CC3161   NC2D1     9     0.000000     0.836800     3",
+    ]
+    if all(x in text for x in inserts):
+        _log(log, "Neu5Ac force-field modification already present")
+        return
+    # Avoid assuming the original CHARMM FF parameter ordering if version differs.
+    old_atoms = {("CC3261", "CC3161", "CC3161", "NC2D1"),
+                 ("NC2D1", "CC3161", "CC3163", "CC312"),
+                 ("NC2D1", "CC3161", "CC3163", "OC3C61")}
+    lines = text.splitlines(keepends=True)
+    match_lines = [i for i, line in enumerate(lines)
+                   if (tokens := line.split()) and tuple(tokens[:4]) in old_atoms and len(tokens) >= 8]
+    if not match_lines or "; i" not in text:
+        raise SetupError(f"Cannot safely apply Neu5Ac correction to {path}; FF layout differs from original")
+    # Original code removed precisely 12 Fourier terms.
+    if len(match_lines) != 12:
+        raise SetupError(f"Expected 12 old Neu5Ac terms in {path}, found {len(match_lines)}")
+    filtered = [line for i, line in enumerate(lines) if i not in set(match_lines)]
+    idx = next((i for i, line in enumerate(filtered) if re.match(r"\s*;\s*i\s+j\s+k\s+l\s+func", line)), None)
+    if idx is None:
+        raise SetupError("Could not locate dihedrals section header for modification")
+    filtered[idx + 1:idx + 1] = [line + "\n" for line in inserts]
+    backup = path.with_suffix(path.suffix + ".original")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+    path.write_text("".join(filtered))
+    _log(log, f"Applied Neu5Ac CHARMM correction to {path} (backup: {backup})")
+
+
+def _minimize(folder: Path, gui: Path, templates: Path, data: dict, log: Path,
+              gmx: str, gmx_mpi: str, module: str | None):
+    target = folder / "01_min_equ"
+    target.mkdir(exist_ok=True)
+    # Populate only absent CHARMM-GUI files; never overwrite an interrupted run.
+    if gui.resolve() != target.resolve():
+        for source in gui.rglob("*"):
+            if source.is_file():
+                destination = target / source.relative_to(gui)
+                if not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+    for name in ("step4.0_minimization.mdp", "step4.1_equilibration.mdp", "step5_production.mdp"):
+        destination = target / name
+        if not destination.exists():
+            source = templates / name
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            shutil.copy2(source, destination)
+
+    present_sia = set(data["monosaccharides"].values()) & SIALIC_NAMES
+    if present_sia:
+        if present_sia - NEU5AC_NAMES:
+            raise SetupError(f"Sialic acid(s) {present_sia - NEU5AC_NAMES} detected, but only Neu5Ac FF correction is validated")
+        ff_path = target / data["simulation"]["forcefield_file"]
+        _apply_neu5ac_correction(ff_path, log)
+
+    for step, coordinate, restraint in MIN_EQU_STEPS:
+        if _nonempty(target / f"{step}.gro") and _nonempty(target / f"{step}.log"):
+            _log(log, f"Skipping completed {step}")
+            continue
+        if not (target / coordinate).is_file():
+            raise SetupError(f"Input for {step} missing: {target / coordinate}")
+        _cmd([gmx, "grompp", "-f", f"{step}.mdp", "-o", f"{step}.tpr",
+              "-c", coordinate, "-r", restraint, "-p", "topol.top", "-n", "index.ndx"],
+             target, log, module=module)
+        _cmd([gmx_mpi, "mdrun", "-deffnm", step], target, log, module=module)
+        if not _nonempty(target / f"{step}.gro"):
+            raise SetupError(f"{step} ended without a nonempty .gro output")
+
+
+def _torsion_definitions(data: dict):
+    """Build glycosidic torsions and ring puckers from the glycan JSON.
+
+    Neu5Ac alpha2-8 edges additionally use omega7, omega8 and omega9,
+    following the supplied plumed_polySia3.dat atom definitions. Ordinary
+    1-6 linkages retain their single omega torsion.
+    """
+    node_resids = {str(k): int(v) for k, v in data["pdb_residues"].items()}
+    lines = []
+    names = []
+    for edge in data["graph_edges"]:
+        parent, child = str(edge["parent"]), str(edge["child"])
+        match = re.fullmatch(r"([abAB])([12])-(\d+)", str(edge["linkage"]))
+        if match is None:
+            raise SetupError(f"Unsupported glycosidic linkage: {edge['linkage']}")
+        _, donor, acceptor = match.groups()
+        d, a = int(donor), int(acceptor)
+        r_parent, r_child = node_resids[parent], node_resids[child]
+        ring_oxygen = data["pucker_ring_atoms"][child][0]
+        suffix = f"{parent}_{child}"
+
+        phi, psi = f"phi{suffix}", f"psi{suffix}"
+        lines.extend([
+            f"{phi}: TORSION ATOMS=@{ring_oxygen}-{r_child},@C{d}-{r_child},@O{a}-{r_parent},@C{a}-{r_parent}",
+            f"{psi}: TORSION ATOMS=@C{d}-{r_child},@O{a}-{r_parent},@C{a}-{r_parent},@C{a-1}-{r_parent}",
+        ])
+        names.extend((phi, psi))
+
+        if a == 8 and d == 2:
+            # These atom definitions have been supplied and validated by the
+            # user for Neu5Ac alpha2-8, not for other 2-8 sugar chemistries.
+            if (data["monosaccharides"][parent] != "Neu5Ac"
+                    or data["monosaccharides"][child] != "Neu5Ac"):
+                raise SetupError(
+                    f"No validated omega7/8/9 atom definitions for {edge['linkage']} "
+                    f"between {data['monosaccharides'][child]} and "
+                    f"{data['monosaccharides'][parent]} (edge {suffix})"
+                )
+            omega_atoms = {
+                "omega7": ("C8", "C7", "C6", "O6"),
+                "omega8": ("O8", "C8", "C7", "C6"),
+                "omega9": ("O8", "C8", "C9", "O9"),
+            }
+            for prefix, atoms in omega_atoms.items():
+                name = f"{prefix}_{suffix}"
+                lines.append(f"{name}: TORSION ATOMS=" + ",".join(
+                    f"@{atom}-{r_parent}" for atom in atoms
+                ))
+                names.append(name)
+        elif a == 6:
+            name = f"omega{suffix}"
+            lines.append(
+                f"{name}: TORSION ATOMS=@O6-{r_parent},@C6-{r_parent},"
+                f"@C5-{r_parent},@C4-{r_parent}"
+            )
+            names.append(name)
+
+    for node, atoms in data["pucker_ring_atoms"].items():
+        if len(atoms) != 6:
+            raise SetupError(f"Ring of node {node} has {len(atoms)} atoms, expected 6")
+        residue = node_resids[str(node)]
+        lines.append(f"puck{node}: PUCKERING ATOMS=" + ",".join(
+            f"@{atom}-{residue}" for atom in atoms
+        ))
+    return lines, names
+
+
+def _peptide_torsions(data: dict):
+    peptide = data.get("peptide")
+    if peptide in (None, "", "none"):
+        return [], []
+    if len(peptide) != 3 or peptide[1] not in "NST":
+        raise SetupError(f"Cannot define glycopeptide torsions automatically for {peptide!r}; expected tripeptide with central N/S/T")
+    root = min(data["pdb_residues"], key=lambda n: int(data["pdb_residues"][n]))
+    root_id = int(data["pdb_residues"][root])
+    sugar_donor = "C2" if data["monosaccharides"][root] in SIALIC_NAMES else "C1"
+    oxygen = data["pucker_ring_atoms"][root][0]
+    # A tripeptide in the CHARMM-GUI PDB precedes glycan residues, as in supplied examples.
+    # A validated topology-linked protein residue identifier should be added for other organizations.
+    pep_res = root_id - 2
+    if pep_res < 1:
+        raise SetupError("Cannot infer peptide attachment residue index from JSON PDB ordering")
+    if peptide[1] == "N":
+        attachment, next_atom, next_next = "ND2", "CG", "CB"
+        spec = [
+            f"phi_gb: TORSION ATOMS=@{oxygen}-{root_id},@{sugar_donor}-{root_id},@{attachment}-{pep_res},@{next_atom}-{pep_res}",
+            f"psi_gb: TORSION ATOMS=@{sugar_donor}-{root_id},@{attachment}-{pep_res},@{next_atom}-{pep_res},@{next_next}-{pep_res}",
+            f"chi2: TORSION ATOMS=@ND2-{pep_res},@CG-{pep_res},@CB-{pep_res},@CA-{pep_res}",
+            f"chi1: TORSION ATOMS=@CG-{pep_res},@CB-{pep_res},@CA-{pep_res},@N-{pep_res}",
+        ]
+        return spec, ["phi_gb", "psi_gb", "chi1", "chi2"]
+    attachment = "OG" if peptide[1] == "S" else "OG1"
+    return [
+        f"phi_gb: TORSION ATOMS=@{oxygen}-{root_id},@{sugar_donor}-{root_id},@{attachment}-{pep_res},@CB-{pep_res}",
+        f"psi_gb: TORSION ATOMS=@{sugar_donor}-{root_id},@{attachment}-{pep_res},@CB-{pep_res},@CA-{pep_res}",
+        f"chi1: TORSION ATOMS=@{attachment}-{pep_res},@CB-{pep_res},@CA-{pep_res},@N-{pep_res}",
+    ], ["phi_gb", "psi_gb", "chi1"]
+
+
+def _write_plumed(folder: Path, data: dict):
+    pucker_and_glycan, biased = _torsion_definitions(data)
+    peptide_def, peptide_bias = _peptide_torsions(data)
+    sim = data["simulation"]
+    factors = sim.get("rect_factors", REST_RECT_FACTORS)
+    if len(factors) != int(sim["n_replica"]):
+        raise SetupError("simulation.rect_factors must contain one RECT factor per replica; default list has 12")
+    temp = float(sim["min_temperature"])
+    # NOTE: HILLS / kinetics reflect these choices; adjustable only via JSON.
+    metad = sim.get("metad", {})
+    pace, tau, sigma = int(metad.get("pace", 500)), float(metad.get("tau", 4.0)), float(metad.get("sigma", 0.35))
+    lines = ["MOLINFO STRUCTURE=reference.pdb", "#"] + peptide_def + pucker_and_glycan + ["#"]
+    for name in [*peptide_bias, *biased]:
+        lines.append(f"metaD_{name}: METAD ARG={name} TAU={tau} PACE={pace} SIGMA={sigma} "
+                     f"GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP={temp} "
+                     f"RECT={','.join(str(f) for f in factors)} FILE=HILLS_{name}")
+    lines += [f"PRINT ARG={','.join([*peptide_bias, *biased])} STRIDE=5000 FILE=COLVAR",
+              "PRINT ARG=*.theta,*.phi STRIDE=5000 FILE=COLVAR_theta",
+              "PRINT ARG=*.bias STRIDE=5000 FILE=COLVAR_metaD"]
+    (folder / "plumed_allangles.dat").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _solute_names(data: dict):
+    """Use actual CHARMM/PDB residue names in JSON, not separate YAML monosaccharide_types."""
+    names = set()
+    for node, sugar in data["monosaccharides"].items():
+        field = data.get("forcefield_residue_names", {}).get(node, {}).get("charmm", {})
+        if isinstance(field, dict):
+            names.update(v for v in field.values() if v)
+        elif field:
+            names.add(field)
+        # User's PDB residue names can be truncated; include them for diagnostics,
+        # but matching processed.top is based on actual column-four residue names.
+    return names
+
+
+def _define_solute(processed: Path, output: Path, data: dict):
+    target = _solute_names(data)
+    if not target:
+        raise SetupError("JSON has no CHARMM residue names for solute selection")
+    lines = processed.read_text().splitlines(keepends=True)
+    out = []
+    found = set()
+    in_atoms = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^\s*\[\s*atoms\s*\]", line):
+            in_atoms = True
+        elif re.match(r"^\s*\[", line):
+            in_atoms = False
+        if in_atoms and stripped and not stripped.startswith(";"):
+            base, sep, comment = line.partition(";")
+            parts = base.split()
+            if len(parts) >= 4 and parts[3] in target:
+                parts[1] = parts[1].rstrip("_") + "_"
+                found.add(parts[3])
+                line = " ".join(parts) + (" ;" + comment if sep else "\n")
+        out.append(line)
+    if not found:
+        raise SetupError(f"No JSON-derived CHARMM residues found in [ atoms ] of {processed}; names={sorted(target)}")
+    output.write_text("".join(out))
+    return found
+
+
+def _organize_rest(folder: Path, rest: Path):
+    rest.mkdir(exist_ok=True)
+    for name in ("generate_HREMD.sh", "partial_tempering_pairs.sh", "job.sh", "mdout.mdp",
+                 "production.mdp", "plumed_allangles.dat", "reference.pdb", "processed.top",
+                 "processed_m.top", "topol.tpr"):
+        src = folder / name
+        if src.is_file():
+            destination = rest / name
+            if destination.exists():
+                raise SetupError(f"Refusing to overwrite existing REST setup file: {destination}")
+            src.replace(destination)
+    for topo in folder.glob("TOPO[0-9]*"):
+        if topo.is_dir():
+            dst = rest / topo.name
+            if dst.exists():
+                raise SetupError(f"Refusing to overwrite existing replica directory: {dst}")
+            shutil.move(str(topo), str(dst))
+
+
+def _setup_rest(folder: Path, data: dict, templates: Path, log: Path,
+                gmx: str, module: str | None):
+    min_equ = folder / "01_min_equ"
+    rest = folder / "02_REST-RECT"
+    rest.mkdir(exist_ok=True)
+    sim = data["simulation"]
+    # Build in the simulation root because generate_HREMD.sh expects relative paths.
+    _copy_templates(templates, folder, list(sim["template_files"]),
+                    required=("generate_HREMD.sh", "job.sh"))
+    for extra in ("partial_tempering_pairs.sh",):
+        src = templates / extra
+        if src.exists():
+            shutil.copy2(src, folder / extra)
+    structure = min_equ / sim["structure_file"]
+    index_file = min_equ / "index.ndx"
+    topol_file = min_equ / "topol.top"
+    for input_file in (structure, index_file, topol_file):
+        if not _nonempty(input_file):
+            raise FileNotFoundError(input_file)
+    _cmd([gmx, "editconf", "-f", str(structure), "-o", "reference.pdb", "-resnr", "1"],
+         folder, log, module=module)
+    _write_plumed(folder, data)
+    _validate_plumed_atoms(folder / "plumed_allangles.dat", folder / "reference.pdb")
+    _cmd([gmx, "grompp", "-f", str(folder / sim["mdp_file"]), "-c", str(structure),
+          "-pp", "processed.top", "-p", str(topol_file), "-n", str(index_file)],
+         folder, log, module=module)
+    found = _define_solute(folder / "processed.top", folder / "processed_m.top", data)
+    _log(log, f"Solute residue names in processed topology: {sorted(found)}")
+    _cmd(["bash", "./generate_HREMD.sh", str(structure), str(sim["n_replica"]),
+          str(sim["min_temperature"]), str(sim["max_temperature"]), sim["mdp_file"], str(index_file)],
+         folder, log)
+    _organize_rest(folder, rest)
+    if not _rest_ready(folder, data):
+        raise SetupError(f"REST-RECT setup incomplete in {rest}; inspect {log}")
+
+def init_glycan_simulation(
+    folder_path: str | Path,
+    glycan_id: str,
+    n_replica: int = 12,
+    min_temperature: float = 310.15,
+    max_temperature: float = 800.0,
+    structure_file: str = "step5_production.gro",
+    mdp_file: str = "production.mdp",
+    template_files: list[str] | None = None,
+    forcefield_file: str = "toppar/forcefield.itp",
+) -> Path:
+    """
+    Add or update simulation configuration in an existing glycan JSON file.
+
+    The configuration is stored under the 'simulation' key.
+    All other existing JSON entries are preserved.
+
+    Parameters
+    ----------
+    glycan_id : str
+        Glycan identifier, e.g. 'Man5'.
+    folder_path : str | Path
+        Library root or the glycan directory containing <glycan_id>.json.
+    n_replica : int
+        Number of REST-RECT replicas.
+    min_temperature, max_temperature : float
+        Minimum and maximum replica temperatures in K.
+    structure_file, mdp_file : str
+        Simulation input filenames.
+    template_files : list[str] | None
+        Template files to include.
+    forcefield_file : str
+        Relative path to the force-field file.
+
+    Returns
+    -------
+    Path
+        Path to the updated JSON file.
+    """
+
+    json_path = find_glycan_directory(folder_path, glycan_id) / f"{glycan_id}.json"
+
+    if not json_path.is_file():
+        raise FileNotFoundError(
+            f"Glycan JSON file not found: {json_path}"
         )
 
-    if isinstance(monosaccharide_types, str):
-        monosaccharide_types = [
-            x.strip() for x in monosaccharide_types.split(",") if x.strip()
+    if template_files is None:
+        template_files = [
+            "*.mdp",
+            "generate_HREMD.sh",
+            "job.sh",
         ]
 
-    glycan: dict[str, Any] = {
-        "path": str(path),
-        "label": label,
-        "ltype": ltype,
-        "carbon_t": carbon_t,
-        "carbon_p": carbon_p,
-    }
+    # Read existing JSON
+    with json_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    optional = {
-        "modify_forcefield_for_neu5ac": modify_forcefield_for_neu5ac,
-        "monosaccharide_types": monosaccharide_types,
-        "peptide": peptide,
+    # Simulation configuration
+    simulation = {
         "n_replica": n_replica,
         "min_temperature": min_temperature,
         "max_temperature": max_temperature,
         "structure_file": structure_file,
         "mdp_file": mdp_file,
+        "template_files": template_files,
+        "forcefield_file": forcefield_file,
     }
-    glycan.update({key: value for key, value in optional.items() if value is not None})
 
-    # Validate against defaults before modifying the file.
-    candidate = deepcopy(config)
-    candidate["glycans"] = deepcopy(config["glycans"])
-    candidate["glycans"][name] = glycan
+    # Preserve existing simulation metadata not listed above
+    data.setdefault("simulation", {}).update(simulation)
 
-    params = merge_config(candidate, name)
-    errors = validate_glycan_config(name, params)
-    if errors:
-        raise SetupError("Invalid glycan configuration:\n" + "\n".join(errors))
+    # Write updated JSON
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+        f.write("\n")
 
-    config["glycans"][name] = glycan
+    print(f"Updated simulation configuration: {json_path}")
 
-    # Atomic write: write a temporary file first, then replace the original.
-    temp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-    try:
-        with temp_path.open("w") as fh:
-            fh.write(
-                "# REST-RECT glycan configuration\n"
-                "#\n"
-                "# Paths are relative to the repository root.\n"
-                "# Keep residue/linkage order identical to the GlyCONFORMER labelling scheme.\n\n"
-            )
-            yaml.safe_dump(
-                config,
-                fh,
-                sort_keys=False,
-                allow_unicode=True,
-                default_flow_style=False,
-            )
-        temp_path.replace(config_path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+    return json_path
 
-    print(f"Added glycan '{name}' to {config_path}")
-    return glycan
-
-
-def available_glycans(config: Mapping[str, Any]) -> list[str]:
-    return list(config["glycans"].keys())
-
-
-def overview_dataframe(config: Mapping[str, Any]):
-    """Return a compact pandas overview for notebook display."""
-    import pandas as pd
-
-    rows = []
-    for name in available_glycans(config):
-        p = merge_config(config, name)
-        rows.append({
-            "glycan": name,
-            "path": p["path"],
-            "replicas": p["n_replica"],
-            "T_min [K]": p["min_temperature"],
-            "T_max [K]": p["max_temperature"],
-            "peptide": p["peptide"],
-            "residues": len(p["carbon_p"]),
-            "linkages": len(p["label"]),
-            "monosaccharide types": ", ".join(p["monosaccharide_types"]),
-        })
-    return pd.DataFrame(rows)
-
-
-def _resolve_repo_root(config_file: Path, repo_root: str | Path | None) -> Path:
-    if repo_root is not None:
-        return Path(repo_root).expanduser().resolve()
-    # config/<file>.yaml -> repository root
-    return config_file.resolve().parent.parent
-
-
-def _resolve_simulation_path(repo_root: Path, configured_path: str | Path) -> Path:
-    p = Path(configured_path).expanduser()
-    if p.is_absolute():
-        return p
-    # The paths in the original notebook were relative to the notebook/repo root.
-    return (repo_root / p).resolve()
-
-def run_command(
-    command: list[str],
-    cwd: Path,
-    *,
-    dry_run: bool = False,
-    env: Mapping[str, str] | None = None,
-    log_file: Path | None = None,
-) -> None:
-    """Run a command with a visible command line and proper error propagation."""
-    print(f"$ {' '.join(command)}")
-    if dry_run:
-        return
-
-    merged_env = os.environ.copy()
-    if env:
-        merged_env.update(env)
-
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        env=merged_env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        with log_file.open("a") as fh:
-            fh.write(f"$ {' '.join(command)}\n")
-            fh.write(result.stdout or "")
-            fh.write("\n")
-    print(result.stdout or "", end="")
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, command, result.stdout)
-
-def preview_setup(name: str, config: Mapping[str, Any], *, repo_root: str | Path | None = None) -> None:
-    """Print exactly what would be done without executing anything."""
-    p = merge_config(config, name)
-    errors = validate_glycan_config(name, p)
-    if errors:
-        raise SetupError("\n".join(errors))
-
-    config_root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
-    sim_path = _resolve_simulation_path(config_root, p["path"])
-    print("=" * 68)
-    print(f"REST-RECT setup: {name}")
-    print("=" * 68)
-    print(f"Simulation directory : {sim_path}")
-    print(f"Replicas             : {p['n_replica']}")
-    print(f"Temperature          : {p['min_temperature']} -> {p['max_temperature']} K")
-    print(f"Structure            : {p['structure_file']}")
-    print(f"REST-RECT MDP        : {p['mdp_file']}")
-    print(f"Peptide              : {p['peptide']}")
-    print(f"Residues             : {len(p['carbon_p'])}")
-    print(f"Linkages             : {len(p['label'])}")
-    print(f"Monosaccharides      : {', '.join(p['monosaccharide_types'])}")
-    print("Linkages:")
-    print("  " + ", ".join(f"{a}-{b} (type {t})" for (a, b), t in zip(p["label"], p["ltype"])))
-    print("=" * 68)
-
-def glygen(
-    name: str,
-    config: Mapping[str, Any],
-    repo_root: str | Path | None = None,
-    template_dir: str | Path | None = None,
-    use_module_load: bool = False,
-    dry_run: bool = False
-) -> Path:
-    """Run the complete setup for one configured glycan.
-
-    The glycan directory must already exist and must contain the
-    characteristic CHARMM-GUI files:
-
-        step3_input.*
-        topol.top
-        index.ndx
-
-    The function also reports independently whether minimisation/
-    equilibration, REST-RECT production, and analysis have already
-    been performed.
-
-    ``use_module_load=True`` prepends the commands with the shell
-    module-loading environment used in the original notebook.
-
-    ``dry_run=True`` performs all filesystem/configuration checks but
-    does not modify files or execute commands.
-    """
-    # GROMACS preprocessing and MD stages.
-    if use_module_load:
-    # Environment Modules are shell functionality. Use bash -lc only when
-    # explicitly requested, so normal Python execution remains portable.
-        prefix = "ml chem/GROMACS && "
-    else:
-        prefix = " "
-
-    config_file_root = (
-        Path(repo_root).expanduser().resolve()
-        if repo_root
-        else Path.cwd().resolve()
-    )
-
-    p = merge_config(config, name)
-    errors = validate_glycan_config(name, p)
-    if errors:
-        raise SetupError("\n".join(errors))
-
-    sim_path = _resolve_simulation_path(
-        config_file_root,
-        p["path"],
-    )
-
-    print(f"\nGlycan: {name}")
-    print(f"Simulation directory: {sim_path}")
-
-    template_dir = (
-        Path(template_dir).expanduser().resolve()
-        if template_dir
-        else config_file_root / "templates"
-    )
-
-    if not template_dir.exists():
-        raise SetupError(
-            f"Template directory does not exist: {template_dir}"
-        )
-
-    if not sim_path.is_dir():
-        raise SetupError(
-            f"Simulation directory for glycan '{name}' does not exist:\n"
-            f"    {sim_path}\n\n"
-            f"Please check the 'path' entry in glycans.yaml."
-        )
-    else:
-        print("✓ Glycan directory exists")
-
-    charmm_gui_dirs = list(sim_path.glob("charmm-gui*"))
-    charmm_gui_dir = charmm_gui_dirs[0]
-    gromacs_dir = charmm_gui_dir / "gromacs"
-    min_equ_dir = sim_path / "01_min_equ"
-    rest_rect_dir = sim_path / "02_REST-RECT"
-    analysis_dir = sim_path / "03_gl_data"
-    topo0 = rest_rect_dir / "TOPO0"
+def generate_glycan_simulation(data_dir: str, glycan_id: str, template_dir: str | Path = "templates",
+           *, gmx: str = "gmx", gmx_mpi: str = "gmx_mpi",
+           gromacs_module: str | None = None) -> Path:
     
-    if charmm_gui_dir.is_dir():
-        print("✓ CHARMM-GUI directory detected")
-        if min_equ_dir.is_dir():
-            print("✓ Minimisation/equilibration already performed")
-            if rest_rect_dir.is_dir():
-                print("✓ REST-RECT simulation already setup")
-                if analysis_dir.is_dir():
-                    print("✓ Analysis already performed")
-                else:
-                    print("✗ Analysis not yet performed")
-
-                    if not dry_run:
-                        analysis_dir.mkdir(exist_ok=True)
-                    
-                        _extract_replica_exchange_statistics(p, rest_rect_dir, sim_path)
-                        _subsample_align_trajectory(prefix, topo0, analysis_dir, sim_path)
-                        _generate_colvar_info(topo0, analysis_dir)
-
-                        hills_files = sorted(Path(topo0).glob("HILLS_*"))
-                        num_hills = len(hills_files)
-                        if num_hills == 0:
-                            raise FileNotFoundError("No HILLS files found in TOPO0.")
-
-                        columns = list(range(2, num_hills + 2))
-                        for hills_file, column in zip(hills_files, columns):
-                            suffix = hills_file.name.removeprefix("HILLS_")
-                            fes_dir = analysis_dir / f"FES_{suffix}_1D".replace(".", "_")
-                            if fes_dir.is_dir():
-                                shutil.rmtree(fes_dir)
-                            fes_dir.mkdir()
-                            _calculate_fes(topo0, hills_file, fes_dir)
-                        
-                            source = fes_dir / "profiles" / "MIN2ZERO" / "fes_00500.dat"
+    """Prepare min/equ and REST-RECT for the glycan found recursively under data_dir."""
+    if gromacs_module is None:
+        gromacs_module = "chem/GROMACS"
     
-                            if source.is_file():
-                                fes_name = fes_dir.name.removeprefix("FES_")
-                                destination = analysis_dir / f"fes_{fes_name}.dat"
-                                shutil.copy2(source, destination)
-                            else:
-                                print(f"File not found: {source}")
-
-            else:
-                _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run)
-        else:
-            _perform_min_equ(gromacs_dir, sim_path, template_dir, p, dry_run)
-            _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run)
-    else:
-        print("✗ CHARMM-GUI directory not present")
-
-def _extract_replica_exchange_statistics(p, rest_rect_dir, sim_path):
-    md_log = Path(rest_rect_dir, "TOPO0", "md.log")
-    output_file = Path(sim_path, "rest_rect_setup.log")
-    #demux
-    subprocess.run(
-        ["helper/demux.pl", str(md_log)],
-        check=True
-    )
-    for filename in ["replica_index.xvg", "replica_temp.xvg"]:
-        Path(filename).replace(Path(rest_rect_dir) / filename)
-    #check exchange probability
-    lines = md_log.read_text().splitlines()
-
-    for i, line in enumerate(lines):
-        if "Replica exchange statistics" in line:
-            with output_file.open("a") as f:
-                f.write("\n".join(lines[i:i + p["n_replica"]]) + "\n")
-            break
-    #rtt implementation still missing
-
-def _subsample_align_trajectory(prefix, topo0, analysis_dir, sim_path):
-    log_file = sim_path / "rest_rect_setup.log"
-    run_command(_cluster_command(prefix, "echo", "0", "|" ,"gmx",
-            "editconf", "-f", "reference.pdb", "-o", "reference_rest-rect.pdb",
-            "-n", "../../01_min_equ/index.ndx"),
-            topo0, log_file=log_file)
-    run_command(_cluster_command(prefix, "echo", "0", "|" ,"gmx",
-            "trjconv", "-f", "traj_comp.xtc", "-o", "conformations_rest-rect.xtc",
-            "-skip", "5", "-n", "../../01_min_equ/index.ndx"),
-            topo0, log_file=log_file)
-    
-    # Load the topology and trajectory files (with bonds!)
-    pdb_file = topo0 / "reference_rest-rect.pdb"
-    xtc_file = topo0 / "conformations_rest-rect.xtc"
-    xtc_aligned_file = topo0 / "conformations_rest-rect_aligned.xtc"
-
-    u = mda.Universe(pdb_file, xtc_file, guess_bonds=True)
-    # Selection used for centering/alignment reference (residues 1-3)
-    align_selection = u.select_atoms("resid 1 or resid 2 or resid 3")
-
-    # Whole system: amino acids + glycan
-    all_atoms = u.atoms
-
-    # Unwrap the whole system so the glycan is made whole (no PBC splitting),
-    # then center the box on residues 1-3 WITHOUT re-wrapping
-    # (re-wrapping after unwrap would just split it again)
-    unwrap_transformation = trans.unwrap(all_atoms)
-    center_transformation = trans.center_in_box(align_selection, wrap=False)
-
-    # Add transformations to the Universe trajectory
-    u.trajectory.add_transformations(unwrap_transformation, center_transformation)
-
-    # Align all frames to the first frame based on residues 1-3 only,
-    # but the whole system moves with the rotation/translation
-    aligner = align.AlignTraj(u, u, select="resid 1 or resid 2 or resid 3", in_memory=True)
-    aligner.run()
-
-    # Write the aligned trajectory (whole system) to a file
-    with mda.Writer(str(xtc_aligned_file), n_atoms=u.atoms.n_atoms) as writer:
-        for ts in u.trajectory:
-            writer.write(u.atoms)
-
-    shutil.copy2(pdb_file, analysis_dir)
-    shutil.copy2(xtc_aligned_file, analysis_dir)
-
-def _calculate_fes(topo0, hills_file, fes_dir):  
-
-    topo0 = Path(topo0)
-    hills_file = Path(hills_file)
-    fes_dir = Path(fes_dir)
-
-    command = (
-    "ml chem/PLUMED && "
-    "plumed sum_hills "
-    f"--hills {hills_file.resolve()} "
-    "--stride 1000 "
-    "--kt 2.579 "
-    "--bin 99 "
-    "--min 0 "
-    "--max 0.5"
-    )
-
-    subprocess.run(
-    ["bash", "-lc", command],
-    cwd=topo0,
-    check=True,
-    )   
-
-    # Move generated fes* files into FES/
-    for fes_file in Path(topo0).glob("fes*"):
-        shutil.move(str(fes_file), fes_dir)
-
-    profiles_dir = fes_dir / "profiles"
-    profiles_dir.mkdir(parents=True, exist_ok=True)
-    for dat_file in fes_dir.glob("*_*.dat"):
-        shutil.move(str(dat_file), profiles_dir / dat_file.name)
-
-    for ii, fes_file in enumerate(sorted(profiles_dir.glob("fes_*.dat"))):
-        new_name = profiles_dir / f"fes_{ii:05d}.dat"
-
-        if fes_file != new_name:
-            fes_file.rename(new_name)
-
-    _shift_fes_to_zero(profiles_dir)
-    
-def _generate_colvar_info(topo0, analysis_dir):
-    colvar_file = topo0 / "COLVAR.0"
-    pucker_file = topo0 / "COLVAR_theta.0"
-    source_file_colvar = analysis_dir / "colvar.dat"
-    source_file_angles = analysis_dir / "angles.dat"
-    source_file_omega = analysis_dir / "omega_angles.dat"
-    source_file_pucker = analysis_dir / "pucker.dat"
-
-    colvar = plumed.read_as_pandas(str(colvar_file))
-    pattern_phi_psi_omega = re.compile(r'^(phi|psi|omega)\d+')
-    filtered_columns_phi_psi_omega = [col for col in colvar.columns if pattern_phi_psi_omega.match(col)]
-    columns_to_save = ["time"] + filtered_columns_phi_psi_omega
-    filtered_data = colvar[columns_to_save]
-    filtered_data.to_csv(source_file_colvar, sep=" ", index=False)
-
-    pucker = plumed.read_as_pandas(str(pucker_file))
-    filtered_columns_pucker = [col for col in pucker.columns if "theta" in col or "phi" in col]
-    columns_to_save = ["time"] + filtered_columns_pucker
-    filtered_data = pucker[columns_to_save]
-    filtered_data.to_csv(source_file_pucker, sep=" ", index=False)
-
-    header_line_phi_psi_omega = ' '.join(filtered_columns_phi_psi_omega)
-    with open(source_file_angles, "w") as file:
-        file.write(header_line_phi_psi_omega + "\n")
-
-    pattern_omega = re.compile(r'^(omega)\d+')
-    filtered_columns_omega = [col for col in colvar.columns if pattern_omega.match(col)]
-    header_line_omega = ' '.join(filtered_columns_omega)
-    with open(source_file_omega, "w") as file:
-        file.write(header_line_omega + "\n")
-
-def _shift_fes_to_zero(profiles_dir: Path):
-
-    profiles_dir = Path(profiles_dir)
-    output_dir = profiles_dir / "MIN2ZERO"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Find and sort FES files
-    fes_files = sorted(profiles_dir.glob("fes*.dat"))
-
-    if not fes_files:
-        raise FileNotFoundError(
-            f"No FES files found in {profiles_dir}"
-        )
-
-    # Determine minimum free energy from the last FES file
-    with fes_files[-1].open("r") as file:
-        lines = file.readlines()[5:]
-
-    free_energies = [
-        float(line.split()[1])
-        for line in lines
-        if line.strip()
-    ]
-
-    minimum_fe = min(free_energies)
-
-    # Process every FES file
-    for fes_file in fes_files:
-
-        with fes_file.open("r") as file:
-            lines = file.readlines()[5:]
-
-        data = [
-            (float(line.split()[0]), float(line.split()[1]))
-            for line in lines
-            if line.strip()
-        ]
-
-        output_file = output_dir / fes_file.name
-
-        with output_file.open("w") as file:
-            for cv, fe in data:
-                shifted_fe = fe - minimum_fe
-                file.write(
-                    f"{cv:<14.9F}{shifted_fe:<14.9F}\n"
+    folder, data = _load(glycan_id, data_dir)
+    templates = Path(template_dir).expanduser().resolve()
+    if not templates.is_dir():
+        raise FileNotFoundError(templates)
+    log = folder / "rest_rect_setup.log"
+    _log(log, f"START setup: {glycan_id}")
+    _log(log, f"Metadata JSON: {folder / (glycan_id + '.json')}")
+    states = status(glycan_id, data_dir)
+    if not states["min_equ"]:
+        gui = _charmm_gromacs(folder)
+        if gui is None and not (folder / "01_min_equ" / "step3_input.gro").exists():
+            raise SetupError(f"Cannot find CHARMM-GUI GROMACS folder for {glycan_id}")
+        _minimize(folder, gui or (folder / "01_min_equ"), templates, data, log,
+                  gmx, gmx_mpi, gromacs_module)
+    if not _min_done(folder):
+        raise SetupError("Minimization/equilibration did not finish")
+    if not _rest_ready(folder, data):
+        # Avoid destroying replicas already prepared by a previous interrupted setup.
+        replicas = list((folder / "02_REST-RECT").glob("TOPO*"))
+        if replicas:
+            missing = _plumed_missing_definitions(folder / "02_REST-RECT" / "plumed_allangles.dat", data)
+            if missing:
+                raise SetupError(
+                    "Existing REST replica directories use an incomplete PLUMED input "
+                    f"({len(missing)} missing entries; examples: {missing[:6]}). "
+                    "For simulations NOT yet started, regenerate plumed_allangles.dat "
+                    "using _write_plumed(folder, data), then replace the existing file "
+                    "in 02_REST-RECT. Already-running or completed simulations cannot "
+                    "be retroactively fixed; a new production run is required. "
+                    "No replica directories were deleted."
                 )
-
-def _cluster_command(binary: str, *args: str) -> list[str]:
-    return ["bash", "-lc", " ".join([binary, *args])]
-    
-    return [binary, *args]
-def _perform_min_equ(gromacs_dir: Path, sim_path: Path, template_dir: Path, p: dict, dry_run: bool = False):
-    print("✗ Minimisation/equilibration not yet performed")
-    if not gromacs_dir.is_dir():
-        raise SetupError(
-            f"CHARMM-GUI gromacs directory not found: {gromacs_dir}"
-        )
-    if not dry_run:
-        shutil.copytree(
-            gromacs_dir,
-            sim_path,
-            dirs_exist_ok=True,
-        )
-    log_file = sim_path / "rest_rect_setup.log"
-    
-    if not dry_run:
-        for filename in [
-            "step4.0_minimization.mdp",
-            "step4.1_equilibration.mdp",
-            "step5_production.mdp",
-        ]:
-            shutil.copy2(
-                template_dir / filename,
-                sim_path / filename,
-            )
-        with log_file.open("a") as fh:
-            fh.write(f"\n=== {datetime.now(timezone.utc).isoformat()} | {name} ===\n")
-            fh.write(json.dumps(p, indent=2, default=str) + "\n")
-    # Optional Neu5Ac force-field edit from the original notebook.
-    if p.get("modify_forcefield_for_neu5ac", False) and not dry_run:
-        remove_lines_and_insert(sim_path, p.get("forcefield_file", "toppar/forcefield.itp"))
-    if dry_run:
-        print(f"\n--- {name}: dry run ---")
-    run_command(_cluster_command(prefix, "gmx",
-        "grompp", "-f", "step4.0_minimization.mdp", "-o", "step4.0_minimization.tpr",
-        "-c", "step3_input.gro", "-r", "step3_input.gro", "-p", "topol.top", "-n", "index.ndx"),
-        sim_path, dry_run=dry_run, log_file=log_file)
-    run_command(_cluster_command(prefix, "gmx_mpi", "mdrun", "-deffnm", "step4.0_minimization"),
-        sim_path, dry_run=dry_run, log_file=log_file)
-
-    run_command(_cluster_command(prefix, "gmx",
-        "grompp", "-f", "step4.1_equilibration.mdp", "-o", "step4.1_equilibration.tpr",
-        "-c", "step4.0_minimization.gro", "-r", "step4.0_minimization.gro",
-        "-p", "topol.top", "-n", "index.ndx"),
-        sim_path, dry_run=dry_run, log_file=log_file)
-    run_command(_cluster_command(prefix, "gmx_mpi", "mdrun", "-deffnm", "step4.1_equilibration"),
-        sim_path, dry_run=dry_run, log_file=log_file)
-
-    run_command(_cluster_command(prefix, "gmx",
-        "grompp", "-f", "step5_production.mdp", "-o", "step5_production.tpr",
-        "-c", "step4.1_equilibration.gro", "-r", "step4.1_equilibration.gro",
-        "-p", "topol.top", "-n", "index.ndx"),
-        sim_path, dry_run=dry_run, log_file=log_file)
-    run_command(_cluster_command(prefix, "gmx_mpi", "mdrun", "-deffnm", "step5_production"),
-        sim_path, dry_run=dry_run, log_file=log_file)
-    min_equ = sim_path / "01_min_equ"
-    if not dry_run:
-            min_equ.mkdir(exist_ok=True)
-    min_equ_names = [
-    "step3_input.gro","step3_input.pdb","step3_input.psf",
-    "step4.0_minimization.mdp", "step4.0_minimization.tpr", "step4.0_minimization.gro",
-    "step4.0_minimization.edr", "step4.0_minimization.log", "step4.0_minimization.mdp",
-    "step4.0_minimization.trr",
-    "step4.1_equilibration.mdp", "step4.1_equilibration.tpr", "step4.1_equilibration.gro",
-    "step4.1_equilibration.edr", "step4.1_equilibration.log", "step4.1_equilibration.cpt",
-    "step4.1_equilibration.xtc",
-    "step5_production.mdp", "step5_production.tpr", "step5_production.gro",
-    "step5_production.edr", "step5_production.log", "step5_production.cpt", "step5_production.xtc",
-    "topol.top", "topol.tpr", "toppar", "index.ndx"
-    ]
-    for name in min_equ_names:
-        src = sim_path / name
-        if src.exists():
-            if dry_run:
-                print(f"MOVE {src.name} -> 01_min_equ/")
-            else:
-                shutil.move(str(src), str(min_equ / src.name))
-
-def _setup_rest_rect(sim_path, template_dir, p, min_equ_dir, name, dry_run):
-    print("✗ REST-RECT simulation not yet setup:")
-    log_file = sim_path / "rest_rect_setup.log"
-    if not dry_run:
-        for filename in [
-        "production.mdp",
-        "job.sh",
-        "partial_tempering_pairs.sh",
-        "generate_HREMD.sh"
-        ]:
-            shutil.copy2(
-                template_dir / filename,
-                sim_path / filename,
-            )
-        with log_file.open("a") as fh:
-            fh.write(f"\n=== {datetime.now(timezone.utc).isoformat()} | {name} ===\n")
-            fh.write(json.dumps(p, indent=2, default=str) + "\n")
-
-    files_to_check = ["plumed_allangles.dat", "reference.pdb", "processed.top", "processed_m.top"]
-    if not dry_run:
-        check_and_delete_files_and_directories(sim_path, files_to_check)
-
-    structure_file = min_equ_dir / p["structure_file"]
-    index_file = min_equ_dir/ "index.ndx"
-    topol_file = min_equ_dir/ "topol.top"
-
-    run_command(_cluster_command(prefix, "gmx", "editconf", "-f", str(structure_file.relative_to(sim_path)),
-        "-o", "reference.pdb", "-resnr", "1"),
-        sim_path, dry_run=dry_run, log_file=log_file)
-
-    if not dry_run:
-        write_plumed(
-            "plumed_allangles.dat",
-            p["peptide"],
-            p["label"],
-            p["ltype"],
-            p["carbon_t"],
-            p["carbon_p"],
-            str(sim_path)
-        )
-
-    run_command(_cluster_command(prefix, "gmx", "grompp", "-f", p["mdp_file"],
-        "-c", str(structure_file.relative_to(sim_path)), "-pp", "processed.top", "-n", str(index_file.relative_to(sim_path)), "-p", str(topol_file.relative_to(sim_path))),
-        sim_path, dry_run=dry_run, log_file=log_file)
-
-    if not dry_run:
-        define_solute(",".join(p["monosaccharide_types"]), str(sim_path))
-
-    run_command(["bash", "./generate_HREMD.sh", str(structure_file.relative_to(sim_path)), str(p["n_replica"]),
-                 str(p["min_temperature"]), str(p["max_temperature"]), p["mdp_file"], str(index_file.relative_to(sim_path))],
-                sim_path, dry_run=dry_run, log_file=log_file)
-
-    _organize_output(sim_path, dry_run=dry_run)
-
-    if not dry_run:
-        _write_metadata(sim_path, name, p)
-
-    print(f"\nCompleted: {name}")
-    return sim_path
-
-def _organize_output(sim_path: Path, *, dry_run: bool = False) -> None:
-    """Organise files exactly once, without destructive wildcard deletes."""
-    
-    rest_rect = sim_path / "02_REST-RECT"
-
-    if not dry_run:
-        rest_rect.mkdir(exist_ok=True)
-
-    rest_names = [
-        "generate_HREMD.sh", "index.ndx", "job.sh", "mdout.mdp", "production.mdp",
-        "plumed_allangles.dat", "reference.pdb", "processed.top", "processed_m.top",
-        "partial_tempering_pairs.sh", "topol.tpr"
-    ]
-    for name in rest_names:
-        src = sim_path / name
-        if src.exists():
-            if dry_run:
-                print(f"MOVE {src.name} -> 02_REST-RECT/")
-            else:
-                shutil.move(str(src), str(rest_rect / src.name))
-
-    for src in sim_path.glob("TOPO*"):
-        if src.is_dir():
-            destination = rest_rect / src.name
-        if dry_run:
-            print(f"MOVE {src.name} -> 02_REST-RECT/")
-
-        else:
-            shutil.move(
-                str(src),
-                str(rest_rect / src.name)
-            )
-
-    if not dry_run:
-        readme = sim_path / "README"
-        if readme.exists():
-            readme.unlink()
+            raise SetupError("Partial REST setup with existing TOPO replica directories detected. "
+                             "Inspect them and restore/finish setup manually; no automatic deletion.")
+        _setup_rest(folder, data, templates, log, gmx, gromacs_module)
+    else:
+        _log(log, "REST-RECT setup already complete; skipping")
+    _log(log, "✓ Setup ready. Transfer 02_REST-RECT to HPC, execute job.sh, and download outputs before analyze_glycan().")
+    return folder / "02_REST-RECT"
 
 
-def _write_metadata(sim_path: Path, name: str, params: Mapping[str, Any]) -> None:
-    metadata = {
-        "glycan": name,
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "configuration": dict(params),
-    }
-    with (sim_path / "metadata.yaml").open("w") as fh:
-        yaml.safe_dump(metadata, fh, sort_keys=False)
+def _plumed_table(path: Path):
+    import pandas as pd
+    with path.open(encoding="utf-8") as f:
+        first = next((line for line in f if line.strip().startswith("#! FIELDS")), None)
+    if first:
+        fields = first.split()[2:]
+        return pd.read_csv(path, sep=r"\s+", comment="#", names=fields)
+    return pd.read_csv(path, sep=r"\s+", comment="#")
 
 
-__all__ = [
-    "SetupError",
-    "load_config",
-    "merge_config",
-    "validate_glycan_config",
-    "validate_config",
-    "available_glycans",
-    "overview_dataframe",
-    "preview_setup",
-    "glygen",
-    "run_command",
-]
+def _colvar_analysis(topo: Path, out: Path):
+    colvar = _plumed_table(topo / "COLVAR.0")
+    if "time" not in colvar.columns:
+        raise SetupError("COLVAR.0 missing time column")
+    torsions = [str(c) for c in colvar.columns if re.fullmatch(r"(?:phi|psi)\d+_\d+|omega(?:7|8|9)?_?\d+_\d+", str(c))]
+    if not torsions:
+        raise SetupError("No named glycosidic dihedrals found in COLVAR.0")
+    colvar[["time", *torsions]].to_csv(out / "colvar.dat", sep=" ", index=False)
+    (out / "angles.dat").write_text(" ".join(torsions) + "\n")
+    (out / "omega_angles.dat").write_text(" ".join(c for c in torsions if c.startswith("omega")) + "\n")
+    pucker = topo / "COLVAR_theta.0"
+    if pucker.is_file():
+        df = _plumed_table(pucker)
+        cols = [c for c in df if "theta" in str(c) or "phi" in str(c)]
+        df[["time", *cols]].to_csv(out / "pucker.dat", sep=" ", index=False)
 
-def update_glycan_in_yaml(
-    config_file: str | Path,
-    name: str,
-    **updates,
-) -> dict[str, Any]:
-    """Update one or more parameters of an existing glycan."""
 
-    config_path = Path(config_file).expanduser().resolve()
-    config = load_config(config_path)
-
-    if name not in config["glycans"]:
-        raise SetupError(f"Glycan '{name}' does not exist in the YAML file.")
-
-    # Update requested parameters
-    for key, value in updates.items():
-        config["glycans"][name][key] = value
-
-    # Validate after modification
-    params = merge_config(config, name)
-    errors = validate_glycan_config(name, params)
-
-    if errors:
-        raise SetupError(
-            "Invalid glycan configuration:\n" +
-            "\n".join(errors)
-        )
-
-    # Write updated YAML
-    with config_path.open("w") as fh:
-        fh.write(
-            "# REST-RECT glycan configuration\n"
-            "#\n"
-            "# Paths are relative to the repository root.\n"
-            "# Keep residue/linkage order identical to the GlyCONFORMER "
-            "labelling scheme.\n\n"
-        )
-
-        yaml.safe_dump(
-            config,
-            fh,
-            sort_keys=False,
-            allow_unicode=True,
-            default_flow_style=False,
-        )
-
-    print(f"Updated glycan '{name}' in {config_path}")
-
-    return config["glycans"][name]
-
-def write_plumed(filename, peptide, label, ltype, carbon_t, carbon_p, directory):
-    # Check if peptide is either "ASA", "ATA" or "ANA"
-    if peptide not in ["ASA", "ANA", "ATA", "none"]:
-        raise ValueError("Peptide must be either 'ASA', 'ATA', 'ANA' or 'none'")
-
-    # Check if label and type lists are the same length
-    if len(label) != len(ltype):
-        raise ValueError("Label and type lists must be the same length")
-
-    # Check if directory exists
-    if not os.path.exists(directory):
-        raise FileNotFoundError(f"The directory {directory} does not exist")
-
-    # Check if we have write permissions to the directory
-    if not os.access(directory, os.W_OK):
-        raise PermissionError(f"Do not have write permissions for the directory {directory}")
-
+def _align_trajectory(topo: Path, out: Path, data: dict, log: Path,
+                      gmx: str, module: str | None):
+    # Requires GROMACS output plus MDAnalysis; avoid assumptions about peptide residues.
+    import MDAnalysis as mda
+    from MDAnalysis.analysis import align
+    import MDAnalysis.transformations as trans
+    pdb = topo / "reference_rest-rect.pdb"
+    traj = topo / "conformations_rest-rect.xtc"
+    target = out / "conformations_rest-rect_aligned.xtc"
+    if not _nonempty(pdb):
+        _cmd([gmx, "editconf", "-f", "reference.pdb", "-o", str(pdb)],
+             topo, log, module=module)
+    if not _nonempty(traj):
+        _cmd([gmx, "trjconv", "-f", "traj_comp.xtc", "-s", "topol.tpr",
+              "-o", str(traj), "-skip", "5"], topo, log, module=module, input_text="0\n")
+    u = mda.Universe(str(pdb), str(traj), guess_bonds=True)
+    selection = "protein" if data.get("peptide") else "all"
+    ref_atoms = u.select_atoms(selection)
+    if len(ref_atoms) < 3:
+        selection = "all"
     try:
-        with open(os.path.join(directory, filename), 'w') as f:
-            if peptide == "ASA":
-                f.write("MOLINFO STRUCTURE=reference.pdb\n#\nphi_gb: TORSION ATOMS=@O5-4,@C1-4,@OG-2,@CB-2\npsi_gb: TORSION ATOMS=@C1-4,@OG-2,@CB-2,@CA-2\n")
-                f.write("chi1: TORSION ATOMS=@OG-2,@CB-2,@CA-2,@N-2\n#\n")
-                f.write("metaD_phi_gb: METAD ARG=phi_gb TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_phi_gb\n")
-                f.write("metaD_psi_gb: METAD ARG=psi_gb TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_psi_gb\n")
-                f.write("metaD_chi1: METAD ARG=chi1 TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_chi1\n#\n")
-            elif peptide == "ANA":
-                f.write("MOLINFO STRUCTURE=reference.pdb\n#\nphi_gb: TORSION ATOMS=@O5-4,@C1-4,@ND2-2,@CG-2\npsi_gb: TORSION ATOMS=@C1-4,@ND2-2,@CG-2,@CB-2\n")
-                f.write("chi2: TORSION ATOMS=@ND2-2,@CG-2,@CB-2,@CA-2\nchi1: TORSION ATOMS=@CG-2,@CB-2,@CA-2,@N-2\n#\n")
-                f.write("metaD_phi_gb: METAD ARG=phi_gb TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_phi_gb\n")
-                f.write("metaD_psi_gb: METAD ARG=psi_gb TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_psi_gb\n")
-                f.write("metaD_chi1: METAD ARG=chi1 TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_chi1\n")
-                f.write("metaD_chi2: METAD ARG=chi2 TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_chi2\n#\n")
-            elif peptide == "ATA":
-                f.write("MOLINFO STRUCTURE=reference.pdb\n#\nphi_gb: TORSION ATOMS=@O5-4,@C1-4,@OG1-2,@CB-2\npsi_gb: TORSION ATOMS=@C1-4,@OG1-2,@CB-2,@CA-2\n")
-                f.write("chi1: TORSION ATOMS=@OG1-2,@CB-2,@CA-2,@N-2\n#\n")
-                f.write("metaD_phi_gb: METAD ARG=phi_gb TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_phi_gb\n")
-                f.write("metaD_psi_gb: METAD ARG=psi_gb TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_psi_gb\n")
-                f.write("metaD_chi1: METAD ARG=chi1 TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_chi1\n#\n")
-            elif peptide == "none":
-                f.write("MOLINFO STRUCTURE=reference.pdb\n#\n")
+        u.trajectory.add_transformations(trans.unwrap(u.atoms),
+                                         trans.center_in_box(u.select_atoms(selection), wrap=False))
+    except (ValueError, AttributeError) as exc:
+        _log(log, f"Skipping PBC unwrap: {exc}")
+    align.AlignTraj(u, u, select=selection, in_memory=True).run()
+    with mda.Writer(str(target), n_atoms=u.atoms.n_atoms) as writer:
+        for _ in u.trajectory:
+            writer.write(u.atoms)
+    shutil.copy2(pdb, out / "reference_rest-rect.pdb")
 
 
-            if peptide in ["ASA", "ANA", "ATA"]:
-                for e,t,l in zip(range(len(label)),ltype,carbon_t): 
-                    if t == 6 and l == 1:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O5-{label[e][1]+3},@C1-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C1-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3},@C{ltype[e]-1}-{label[e][0]+3}\n")
-                        f.write(f"omega{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3},@C{ltype[e]-1}-{label[e][0]+3},@C{ltype[e]-2}-{label[e][0]+3}\n#\n")
-                    elif t == 6 and l == 2:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O6-{label[e][1]+3},@C2-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C2-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3},@C{ltype[e]-1}-{label[e][0]+3}\n")
-                        f.write(f"omega{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3},@C{ltype[e]-1}-{label[e][0]+3},@C{ltype[e]-2}-{label[e][0]+3}\n#\n")
-                    elif t != 6 and l == 2:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O6-{label[e][1]+3},@C2-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C2-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3},@C{ltype[e]-1}-{label[e][0]+3}\n#\n")
-                    else:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O5-{label[e][1]+3},@C1-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C1-{label[e][1]+3},@O{ltype[e]}-{label[e][0]+3},@C{ltype[e]}-{label[e][0]+3},@C{ltype[e]-1}-{label[e][0]+3}\n#\n")
-                for i,l in zip(range(1,len(carbon_p)+1),carbon_p):
-                    if l == 1:
-                        f.write(f"puck{i}: PUCKERING ATOMS=@O5-{i+3},@C1-{i+3},@C2-{i+3},@C3-{i+3},@C4-{i+3},@C5-{i+3}\n")
-                    else:
-                        f.write(f"puck{i}: PUCKERING ATOMS=@O6-{i+3},@C2-{i+3},@C3-{i+3},@C4-{i+3},@C5-{i+3},@C6-{i+3}\n")
+def _fes(topo: Path, out: Path, log: Path, *, plumed_module: str | None, temperature: float):
+    import numpy as np
+    hills_files = sorted(topo.glob("HILLS_*"))
+    if not hills_files:
+        raise SetupError(f"No HILLS_* files found in {topo}")
+    kbt = 0.008314462618 * temperature
+    for hills in hills_files:
+        suffix = hills.name.removeprefix("HILLS_").replace(".", "_")
+        target = out / f"fes_{suffix}.dat"
+        if _nonempty(target):
+            _log(log, f"Skipping existing FES {target.name}")
+            continue
+        fes_dir = out / f"FES_{suffix}_1D"
+        fes_dir.mkdir(parents=True, exist_ok=True)
+        # Generate directly into a dedicated directory, not TOPO0.
+        _cmd(["plumed", "sum_hills", "--hills", str(hills.resolve()), "--stride", "1000",
+              "--kt", str(kbt), "--bin", "99", "--min", "0", "--max", "0.5"],
+             fes_dir, log, module=plumed_module)
+        profiles = fes_dir / "profiles" / "MIN2ZERO"
+        profiles.mkdir(parents=True, exist_ok=True)
+        fes_files = sorted(fes_dir.glob("fes_*.dat"),
+                           key=lambda p: int(p.stem.split("_")[-1])
+                           if p.stem.split("_")[-1].isdigit() else -1)
+        if not fes_files:
+            raise SetupError(f"PLUMED sum_hills returned no FES for {hills}")
+        # Shift every FES using global min of last time-window FES (original convention).
+        def read_profile(path):
+            return np.loadtxt(path, comments="#")
+        last = read_profile(fes_files[-1])
+        offset = float(np.min(last[:, 1]))
+        for i, f in enumerate(fes_files):
+            arr = read_profile(f)
+            arr[:, 1] -= offset
+            np.savetxt(profiles / f"fes_{i:05d}.dat", arr, fmt="%.9f")
+        shutil.copy2(profiles / f"fes_{len(fes_files)-1:05d}.dat", target)
 
-                f.write(f"#\n")
-            
-            else:
-                for e,t,l in zip(range(len(label)),ltype,carbon_t): 
-                    if t == 6 and l == 1:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O5-{label[e][1]},@C1-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C1-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]},@C{ltype[e]-1}-{label[e][0]}\n")
-                        f.write(f"omega{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]},@C{ltype[e]-1}-{label[e][0]},@C{ltype[e]-2}-{label[e][0]}\n#\n")
-                    elif t == 6 and l == 2:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O6-{label[e][1]},@C2-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C2-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]},@C{ltype[e]-1}-{label[e][0]}\n")
-                        f.write(f"omega{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]},@C{ltype[e]-1}-{label[e][0]},@C{ltype[e]-2}-{label[e][0]}\n#\n")
-                    elif t != 6 and l == 2:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O6-{label[e][1]},@C2-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C2-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]},@C{ltype[e]-1}-{label[e][0]}\n#\n")
-                    else:
-                        f.write(f"phi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@O5-{label[e][1]},@C1-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]}\n")
-                        f.write(f"psi{label[e][0]}_{label[e][1]}: TORSION ATOMS=@C1-{label[e][1]},@O{ltype[e]}-{label[e][0]},@C{ltype[e]}-{label[e][0]},@C{ltype[e]-1}-{label[e][0]}\n#\n")
-                for i,l in zip(range(1,len(carbon_p)+1),carbon_p):
-                    if l == 1:
-                        f.write(f"puck{i}: PUCKERING ATOMS=@O5-{i},@C1-{i},@C2-{i},@C3-{i},@C4-{i},@C5-{i}\n")
-                    else:
-                        f.write(f"puck{i}: PUCKERING ATOMS=@O6-{i},@C2-{i},@C3-{i},@C4-{i},@C5-{i},@C6-{i}\n")
-                
-                f.write(f"#\n")
 
-            for e,t in zip(range(len(label)),ltype):
-                if t == 6:
-                    f.write(f"metaD_phi{label[e][0]}_{label[e][1]}: METAD ARG=phi{label[e][0]}_{label[e][1]} TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_phi{label[e][0]}_{label[e][1]}\n")
-                    f.write(f"metaD_psi{label[e][0]}_{label[e][1]}: METAD ARG=psi{label[e][0]}_{label[e][1]} TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_psi{label[e][0]}_{label[e][1]}\n")
-                    f.write(f"metaD_omega{label[e][0]}_{label[e][1]}: METAD ARG=omega{label[e][0]}_{label[e][1]} TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_omega{label[e][0]}_{label[e][1]}\n#\n")
-                else:
-                    f.write(f"metaD_phi{label[e][0]}_{label[e][1]}: METAD ARG=phi{label[e][0]}_{label[e][1]} TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_phi{label[e][0]}_{label[e][1]}\n")
-                    f.write(f"metaD_psi{label[e][0]}_{label[e][1]}: METAD ARG=psi{label[e][0]}_{label[e][1]} TAU=4.0 PACE=500 SIGMA=0.35 GRID_MIN=-pi GRID_MAX=pi GRID_BIN=200 TEMP=310.15 RECT=1,1.2,1.46,1.82,2.3,2.94,3.78,4.89,6.34,8.23,10.7,14 FILE=HILLS_psi{label[e][0]}_{label[e][1]}\n#\n")
-            f.write(f"PRINT ARG=* STRIDE=5000 FILE=COLVAR\n#\nPRINT ARG=*.theta,*.phi STRIDE=5000 FILE=COLVAR_theta\n#\nPRINT ARG=*.bias STRIDE=5000 FILE=COLVAR_metaD")
+def _exchange_stats(folder: Path, topo: Path, log: Path):
+    mdlog = topo / "md.log"
+    lines = mdlog.read_text(errors="replace").splitlines()
+    index = next((i for i, line in enumerate(lines) if "Replica exchange statistics" in line), None)
+    if index is not None:
+        text = "\n".join(lines[index:index + 20])
+        # Repeated calls should not append the same block.
+        if text not in log.read_text(errors="replace"):
+            _log(log, text)
+    demux = Path("helper/demux.pl")
+    if demux.is_file():
+        _cmd([str(demux.resolve()), str(mdlog.resolve())], folder, log)
+        for name in ("replica_index.xvg", "replica_temp.xvg"):
+            src = folder / name
+            if src.is_file():
+                src.replace(folder / "02_REST-RECT" / name)
 
-    except IOError:
-        print(f"Error writing to file {filename}")
 
-def define_solute(target_words_input, path):
-
-    target_words = [word.strip() for word in target_words_input.split(",")]
-
-    try:
-        with open(os.path.join(path, "processed.top"), "r") as infile:
-            lines = infile.readlines()
-
-        # Process each line and print the modified output
-        with open(os.path.join(path, "processed_m.top"), "w") as outfile:
-            for line in lines:
-                # Split the line into columns
-                columns = line.split()
-                # Check if the fourth column matches any of the target words
-                if len(columns) >= 4 and columns[3] in target_words:
-                # Append an underscore to the second column
-                    columns[1] += "_"
-                # Join the modified columns back into a line
-                modified_line = " ".join(columns)                
-                outfile.write(modified_line + "\n")
-
-        print(f"Lines saved")
-    except FileNotFoundError:
-        print("File not found. Please check the file path.")
-
-def check_and_delete_files_and_directories(directory_path, files_to_check):
+def analyze_glycan(data_dir: str, glycan_id: str, *,
+                   gmx: str = "gmx", gromacs_module: str | None = None,
+                   plumed_module: str | None = None) -> Path:
+    if gromacs_module is None:
+        gromacs_module = "chem/GROMACS"
+    if plumed_module is None:
+        plumed_module = "chem/PLUMED"
     
-    # Check and delete the files
-    for file_name in files_to_check:
-        file_path = os.path.join(directory_path, file_name)
-        
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                print(f"{file_name} found and deleted.")
-            except OSError as e:
-                print(f"Error deleting {file_name}: {e}")
-        else:
-            print(f"{file_name} does not exist in the directory.")
+    """Analyze completed, downloaded REST-RECT output, preserving completed artifacts."""
+    folder, data = _load(glycan_id, data_dir)
+    log = folder / "rest_rect_setup.log"
+    if not _production_done(folder, data):
+        raise SetupError(f"Production outputs for {glycan_id} are incomplete. Download HPC results first.")
+    out = folder / "03_lib"
+    out.mkdir(exist_ok=True)
+    topo = folder / "02_REST-RECT" / "TOPO0"
+    if _analysis_done(folder, data):
+        _log(log, f"Analysis already complete: {glycan_id}")
+        return out
+    _log(log, f"Starting analysis: {glycan_id}")
+    _exchange_stats(folder, topo, log)
+    if not (_nonempty(out / "reference_rest-rect.pdb") and _nonempty(out / "conformations_rest-rect_aligned.xtc")):
+        _align_trajectory(topo, out, data, log, gmx, gromacs_module)
+    if not _nonempty(out / "colvar.dat"):
+        _colvar_analysis(topo, out)
+    _fes(topo, out, log, plumed_module=plumed_module,
+         temperature=float(data["simulation"]["min_temperature"]))
+    _log(log, f"Analysis {'complete' if _analysis_done(folder, data) else 'partially complete'}: {glycan_id}")
+    return out
 
-    # Check and delete directories starting with "TOPO"
-    for item in os.listdir(directory_path):
-        if item.startswith("TOPO") and os.path.isdir(os.path.join(directory_path, item)):
-            dir_path = os.path.join(directory_path, item)
-            try:
-                shutil.rmtree(dir_path)  # Use shutil.rmtree to delete directories and their contents
-                print(f"Directory {item} found and deleted.")
-            except OSError as e:
-                print(f"Error deleting directory {item}: {e}")
 
-def remove_lines_and_insert(path, filename):
-    # Read the entire file into memory
-    with open(os.path.join(path, filename), 'r') as file:
-        lines = file.readlines()
-
-    # Search for the lines to be removed
-    lines_to_remove = [
-    " CC3261  CC3161  CC3161   NC2D1     9  1.800000e+02  8.266329e+00      1\n",
-    " CC3261  CC3161  CC3161   NC2D1     9  0.000000e+00  7.073889e+00      2\n",
-	" CC3261  CC3161  CC3161   NC2D1     9  0.000000e+00  4.167682e+00      3\n",
-	" CC3261  CC3161  CC3161   NC2D1     9  0.000000e+00  1.317123e+00      6\n",
-	"  NC2D1  CC3161  CC3163   CC312     9  1.800000e+02  8.903970e+00      1\n",
-	"  NC2D1  CC3161  CC3163   CC312     9  0.000000e+00  5.750490e+00      2\n",
-	"  NC2D1  CC3161  CC3163   CC312     9  0.000000e+00  2.450987e+00      3\n",
-	"  NC2D1  CC3161  CC3163   CC312     9  0.000000e+00  3.709116e+00      6\n",
-	"  NC2D1  CC3161  CC3163  OC3C61     9  0.000000e+00  7.568856e+00      1\n",
-	"  NC2D1  CC3161  CC3163  OC3C61     9  1.800000e+02  2.875663e+00      2\n",
-	"  NC2D1  CC3161  CC3163  OC3C61     9  1.800000e+02  5.568904e+00      3\n",
-	"  NC2D1  CC3161  CC3163  OC3C61     9  1.800000e+02  2.367307e+00      6\n"
-    ]
-
-    # Remove the specified lines
-    updated_lines = [line for line in lines if line not in lines_to_remove]
-
-    # Insert the new lines after the specified comment line
-    comment_line = "; i	j	k	l	func	phi0	Kphi	mult\n"
-    new_lines = [
-        "  NC2D1  CC3161  CC3161  CC3261     9     0.000000     0.836800     3\n",
-        "  CC312  CC3163  CC3161   NC2D1     9     0.000000     0.836800     3\n",
-        " OC3C61  CC3163  CC3161   NC2D1     9     0.000000     0.836800     3\n"
-    ]
-
-    # Find the index of the comment line
-    comment_line_index = updated_lines.index(comment_line)
-
-    # Insert the new lines after the comment line
-    updated_lines[comment_line_index + 1:comment_line_index + 1] = new_lines
-
-    # Write the updated content back to the file
-    with open(os.path.join(path, filename), 'w') as file:
-        file.writelines(updated_lines)
-    
-    # Print messages indicating the changes
-    print("Lines removed:")
-    for line in lines_to_remove:
-        if line in lines:
-            print(line.strip())
-
-    print("\nLines added:")
-    for line in new_lines:
-        print(line.strip())
+__all__ = ["SetupError", "find_glycan_directory", "status", "init_glycan_simulation", "generate_glycan_simulation", "analyze_glycan"]
