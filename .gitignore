@@ -5,9 +5,11 @@ __pycache__/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+Workflow_intern.ipynb
 
 # IPython
 profile_default/
 ipython_config.py
 
 data/
+test/
