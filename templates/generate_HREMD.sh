@@ -36,7 +36,7 @@ do
 echo 'lambda', $lambda
   # process topology
   # (if you are curious, try "diff topol0.top topol1.top" to see the changes)
-  partial_tempering_pairs.sh $lambda < processed_m.top > topol$i.top
+  ./partial_tempering_pairs.sh $lambda < processed_m.top > topol$i.top
   # prepare tpr file
   # -maxwarn is often needed because box could be charged
   gmx grompp -maxwarn 2 -o topol$i.tpr -f $mdpfile -p topol$i.top -n $index -c $input

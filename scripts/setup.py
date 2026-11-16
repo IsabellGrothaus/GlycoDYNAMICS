@@ -506,16 +506,37 @@ def _write_plumed(folder: Path, data: dict):
 
 
 def _solute_names(data: dict):
-    """Use actual CHARMM/PDB residue names in JSON, not separate YAML monosaccharide_types."""
+    """Return residue names belonging to the REST-RECT solute."""
     names = set()
-    for node, sugar in data["monosaccharides"].items():
-        field = data.get("forcefield_residue_names", {}).get(node, {}).get("charmm", {})
+
+    forcefield_names = data.get("forcefield_residue_names", {})
+
+    is_glycam = all(
+        forcefield_names.get(node, {}).get("glycam06_topology_name")
+        for node in data["monosaccharides"]
+    )
+
+    if is_glycam:
+        # Include all GLYCAM monosaccharides.
+        names.update(
+            forcefield_names[node]["glycam06_topology_name"]
+            for node in data["monosaccharides"]
+        )
+
+        # Include the reducing-end aglycone/cap.
+        names.add("ROH")
+
+        return names
+
+    # Original CHARMM behavior.
+    for node in data["monosaccharides"]:
+        field = forcefield_names.get(node, {}).get("charmm", {})
+
         if isinstance(field, dict):
             names.update(v for v in field.values() if v)
         elif field:
             names.add(field)
-        # User's PDB residue names can be truncated; include them for diagnostics,
-        # but matching processed.top is based on actual column-four residue names.
+
     return names
 
 
