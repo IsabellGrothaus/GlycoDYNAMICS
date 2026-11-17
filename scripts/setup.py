@@ -312,15 +312,85 @@ def _minimize(folder: Path, gui: Path, templates: Path, data: dict, log: Path,
         if not _nonempty(target / f"{step}.gro"):
             raise SetupError(f"{step} ended without a nonempty .gro output")
 
+def _plumed_residue_mapping(data: dict, reference_pdb: Path) -> dict[str, int]:
+    """Map glycan JSON nodes to residue numbers in the PLUMED reference PDB."""
 
-def _torsion_definitions(data: dict):
+    node_resids = {
+        str(node): int(resid)
+        for node, resid in data["pdb_residues"].items()
+    }
+
+    # Preserve existing CHARMM behavior.
+    is_glycam = all(
+        data.get("forcefield_residue_names", {})
+            .get(node, {})
+            .get("glycam06_topology_name")
+        for node in data["monosaccharides"]
+    )
+
+    if not is_glycam:
+        return node_resids
+
+    topology_names = {
+        str(node): info["glycam06_topology_name"]
+        for node, info in data["forcefield_residue_names"].items()
+    }
+
+    pdb_residues = []
+    seen = set()
+
+    with reference_pdb.open() as f:
+        for line in f:
+            if not line.startswith(("ATOM  ", "HETATM")):
+                continue
+
+            resid = int(line[22:26])
+            resname = line[17:20].strip()
+
+            if resid not in seen:
+                seen.add(resid)
+                pdb_residues.append((resid, resname))
+
+    glycan_residues = [
+        (resid, resname)
+        for resid, resname in pdb_residues
+        if resname in set(topology_names.values())
+    ]
+
+    ordered_nodes = sorted(node_resids, key=lambda node: node_resids[node])
+
+    if len(glycan_residues) != len(ordered_nodes):
+        raise SetupError(
+            "GLYCAM residue count mismatch between JSON and reference.pdb"
+        )
+
+    mapping = {}
+
+    for node, (resid, resname) in zip(ordered_nodes, glycan_residues):
+        expected = topology_names[node]
+
+        if resname != expected:
+            raise SetupError(
+                f"GLYCAM residue mismatch for node {node}: "
+                f"expected {expected}, found {resname}"
+            )
+
+        mapping[node] = resid
+
+    return mapping
+
+def _torsion_definitions(data: dict, node_resids: dict[str, int] | None = None,):
     """Build glycosidic torsions and ring puckers from the glycan JSON.
 
     Neu5Ac alpha2-8 edges additionally use omega7, omega8 and omega9,
     following the supplied plumed_polySia3.dat atom definitions. Ordinary
     1-6 linkages retain their single omega torsion.
     """
-    node_resids = {str(k): int(v) for k, v in data["pdb_residues"].items()}
+    if node_resids is None:
+        node_resids = {
+            str(k): int(v)
+            for k, v in data["pdb_residues"].items()
+        }
     lines = []
     names = []
     for edge in data["graph_edges"]:
@@ -413,7 +483,8 @@ def _peptide_torsions(data: dict):
 
 
 def _write_plumed(folder: Path, data: dict):
-    pucker_and_glycan, biased = _torsion_definitions(data)
+    node_resids = _plumed_residue_mapping(data, folder / "reference.pdb",)
+    pucker_and_glycan, biased = _torsion_definitions(data, node_resids=node_resids,)   
     peptide_def, peptide_bias = _peptide_torsions(data)
     sim = data["simulation"]
     factors = sim.get("rect_factors", REST_RECT_FACTORS)
@@ -435,16 +506,37 @@ def _write_plumed(folder: Path, data: dict):
 
 
 def _solute_names(data: dict):
-    """Use actual CHARMM/PDB residue names in JSON, not separate YAML monosaccharide_types."""
+    """Return residue names belonging to the REST-RECT solute."""
     names = set()
-    for node, sugar in data["monosaccharides"].items():
-        field = data.get("forcefield_residue_names", {}).get(node, {}).get("charmm", {})
+
+    forcefield_names = data.get("forcefield_residue_names", {})
+
+    is_glycam = all(
+        forcefield_names.get(node, {}).get("glycam06_topology_name")
+        for node in data["monosaccharides"]
+    )
+
+    if is_glycam:
+        # Include all GLYCAM monosaccharides.
+        names.update(
+            forcefield_names[node]["glycam06_topology_name"]
+            for node in data["monosaccharides"]
+        )
+
+        # Include the reducing-end aglycone/cap.
+        names.add("ROH")
+
+        return names
+
+    # Original CHARMM behavior.
+    for node in data["monosaccharides"]:
+        field = forcefield_names.get(node, {}).get("charmm", {})
+
         if isinstance(field, dict):
             names.update(v for v in field.values() if v)
         elif field:
             names.add(field)
-        # User's PDB residue names can be truncated; include them for diagnostics,
-        # but matching processed.top is based on actual column-four residue names.
+
     return names
 
 

@@ -62,6 +62,163 @@ POSITION_CODES = {(): '0',(2,):'2',(3,):'3',(4,):'4',(6,):'6',
 NAME_RE = '|'.join(sorted(map(re.escape, REGISTRY), key=len, reverse=True))
 TOKEN_RE = re.compile(r'\s*(\[|\]|(?:' + NAME_RE + r')(?:\(([ab?\u03b1\u03b2])([12])-(\d+|\?)\))?)')
 
+def _validate_forcefield(forcefield):
+    if forcefield not in ("charmm", "glycam"):
+        raise ValueError(
+            "forcefield must be 'charmm' or 'glycam'"
+        )
+    return forcefield
+
+def _glycam_code_identity(code):
+    """
+    Resolve a GLYCAM residue name using REGISTRY.
+
+    Raises
+    ------
+    ValueError
+        If the residue name is invalid, unknown, or ambiguous.
+    """
+
+    code = code.strip().upper()
+
+    if len(code) != 3:
+        raise ValueError(
+            f"Invalid GLYCAM residue name '{code}': "
+            "expected a three-character code."
+        )
+
+    position_code, family_code, anomer_code = code
+
+    if position_code not in POSITION_CODES.values():
+        raise ValueError(
+            f"Unknown GLYCAM substitution code '{position_code}' "
+            f"in residue '{code}'."
+        )
+
+    if anomer_code not in {"A", "B"}:
+        raise ValueError(
+            f"Unknown GLYCAM anomer code '{anomer_code}' "
+            f"in residue '{code}'."
+        )
+
+    matches = [
+        name
+        for name, spec in REGISTRY.items()
+        if spec.get("glycam") is not None
+        and spec["glycam"].upper() == family_code
+    ]
+
+    if not matches:
+        raise ValueError(
+            f"Cannot identify GLYCAM residue '{code}': "
+            f"family code '{family_code}' is not defined in REGISTRY."
+        )
+
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous GLYCAM residue '{code}': "
+            f"family code '{family_code}' matches {matches}."
+        )
+
+    return matches[0], anomer_code.lower()
+
+def _glycam_residue_identity(residue, signatures):
+    """
+    Identify a GLYCAM monosaccharide and validate it
+    against the GROMACS topology.
+
+    Special case:
+        PDB name ROH -> sugar name from topology.
+
+    Returns
+    -------
+    tuple
+        (monosaccharide_name, anomer, evidence)
+
+    Raises
+    ------
+    ValueError
+        If identification or validation fails.
+    """
+
+    code = residue["resName"].strip().upper()
+    segment = residue["segment"]
+    resseq = residue["resSeq"]
+
+    residue_id = f"{code} {segment}:{resseq}"
+
+    if not signatures:
+        raise ValueError(
+            f"Cannot validate GLYCAM residue {residue_id}: "
+            "no topology signatures available."
+        )
+
+    pdb_heavy = {
+        atom.upper()
+        for atom in residue["atoms"]
+        if not atom.upper().startswith(("H", "D"))
+    }
+
+    matches = set()
+    evidence = set()
+
+    for names, atoms, source in signatures:
+
+        names = {name.upper() for name in names}
+
+        # Match the PDB residue label to the topology.
+        if code not in names:
+            continue
+
+        topology_heavy = {
+            atom.upper()
+            for atom in atoms
+            if not atom.upper().startswith(("H", "D"))
+        }
+
+        # Require compatible heavy-atom names.
+        if not pdb_heavy.issubset(topology_heavy):
+            continue
+
+        if code == "ROH":
+            # ROH is a reducing-end label, not a sugar code.
+            sugar_labels = names - {"ROH"}
+
+            if len(sugar_labels) != 1:
+                raise ValueError(
+                    f"Cannot uniquely identify {residue_id}: "
+                    f"topology sugar labels are {sorted(sugar_labels)}."
+                )
+
+            sugar_code = next(iter(sugar_labels))
+
+        else:
+            sugar_code = code
+
+        # Uses your strict REGISTRY-based decoder.
+        # Unknown or ambiguous codes raise ValueError.
+        name, anomer = _glycam_code_identity(sugar_code)
+
+        matches.add((name, anomer))
+        evidence.add(f"{source.name}:{sugar_code}")
+
+    if not matches:
+        raise ValueError(
+            f"Cannot validate GLYCAM residue {residue_id}: "
+            "no matching residue name and heavy-atom "
+            "signature found in the topology."
+        )
+
+    if len(matches) != 1:
+        raise ValueError(
+            f"Ambiguous GLYCAM residue {residue_id}: "
+            f"multiple identities found: {sorted(matches)}."
+        )
+
+    name, anomer = next(iter(matches))
+
+    return name, anomer, sorted(evidence)
+
 
 def _parse_iupac(iupac):
     tokens, pos = [], 0
@@ -500,63 +657,141 @@ def _topology_residue_signatures(files):
 
     The residue-name column is not restricted to four characters, unlike PDB.
     Parsing only the [ atoms ] section avoids accidentally reading atomtypes.
+
+    Multiple residue labels sharing the same topology residue number
+    (e.g. ROH + 4YA) are grouped into one residue.
     """
     from collections import defaultdict
+
     entries = []
+
     for path in files:
         section = None
         molecule = None
-        residues = defaultdict(set)
-        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+
+        # CHANGED: Group by residue number and retain all residue labels.
+        residues = defaultdict(lambda: {"names": set(), "atoms": set()})
+
+        for raw in path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+
             line = raw.partition(";")[0].strip()
+
             if not line or line.startswith("#"):
                 continue
+
             hit = re.match(r"^\[\s*([^\]]+)\s*\]$", line)
+
             if hit:
                 section = hit.group(1).strip().lower()
+
                 if section == "moleculetype":
                     if residues:
-                        entries.extend((name, frozenset(atoms), path) for (number, name), atoms in residues.items())
+                        # CHANGED: Preserve the existing tuple structure.
+                        entries.extend(
+                            (
+                                frozenset(group["names"]),
+                                frozenset(group["atoms"]),
+                                path,
+                            )
+                            for group in residues.values()
+                        )
                         residues.clear()
+
                     molecule = None
+
                 continue
+
             if section == "moleculetype" and molecule is None:
                 molecule = line.split()[0]
+
             elif section == "atoms" and molecule is not None:
                 cols = line.split()
-                if len(cols) >= 5 and cols[0].isdigit() and cols[2].lstrip("-").isdigit():
+
+                if (
+                    len(cols) >= 5
+                    and cols[0].isdigit()
+                    and cols[2].lstrip("-").isdigit()
+                ):
                     # nr type resnr residue atom cgnr charge mass
-                    residues[(cols[2], cols[3].upper())].add(cols[4].upper())
+
+                    # CHANGED: Use residue number as the grouping key.
+                    group = residues[cols[2]]
+
+                    # CHANGED: Keep complete residue and atom names.
+                    group["names"].add(cols[3].upper())
+                    group["atoms"].add(cols[4].upper())
+
         if residues:
-            entries.extend((name, frozenset(atoms), path) for (number, name), atoms in residues.items())
+            entries.extend(
+                (
+                    frozenset(group["names"]),
+                    frozenset(group["atoms"]),
+                    path,
+                )
+                for group in residues.values()
+            )
+
     return entries
 
 
-def _topology_identity(residue, signatures):
-    """Resolve a residue through full GROMACS residue names AND its atom signature.
+def _topology_identity(residue, signatures, forcefield="charmm"):
+    """Resolve a CHARMM residue using GROMACS names and atom signatures.
 
-    Require all PDB heavy atoms to match a topology residue signature. Missing
-    hydrogen atoms are tolerated, but different heavy-atom compositions are not.
-    Return (name, anomer, evidence), or None when topology is inconclusive.
+    Require PDB heavy atoms to be present in the matching topology
+    residue. Missing hydrogen atoms are tolerated.
+
+    Returns (name, anomer, evidence), or None if inconclusive.
     """
+    if forcefield == "glycam":
+        return _glycam_residue_identity(residue, signatures)
+
+    if forcefield != "charmm":
+        raise ValueError(
+            f"Unsupported force field '{forcefield}'. "
+            "Expected 'charmm' or 'glycam'."
+        )
     code = residue["resName"].upper()
-    pdb_atoms = {a.upper() for a in residue["atoms"] if not a.upper().startswith(("H", "D"))}
+
+    pdb_atoms = {
+        a.upper()
+        for a in residue["atoms"]
+        if not a.upper().startswith(("H", "D"))
+    }
+
     compatible = set()
     evidence = set()
-    for resname, atom_names, source in signatures:
-        if code != resname and code != resname[:4]:
-            continue
-        heavy = {a for a in atom_names if not a.startswith(("H", "D"))}
-        if not pdb_atoms.issubset(heavy):
-            continue
-        for name, spec in REGISTRY.items():
-            for anomer, full in spec["charmm"].items():
-                if resname == full.upper():
-                    compatible.add((name, anomer))
-                    evidence.add(f"{source.name}:{resname}")
+
+    for resnames, atom_names, source in signatures:
+
+        # A topology residue may contain multiple residue labels.
+        for resname in resnames:
+
+            # Preserve the original CHARMM name-matching logic.
+            if code != resname and code != resname[:4]:
+                continue
+
+            heavy = {
+                a.upper()
+                for a in atom_names
+                if not a.upper().startswith(("H", "D"))
+            }
+
+            if not pdb_atoms.issubset(heavy):
+                continue
+
+            # Preserve the original CHARMM REGISTRY lookup.
+            for name, spec in REGISTRY.items():
+                for anomer, full in spec["charmm"].items():
+                    if resname == full.upper():
+                        compatible.add((name, anomer))
+                        evidence.add(f"{source.name}:{resname}")
+
     if len(compatible) == 1:
         name, anomer = next(iter(compatible))
         return name, anomer, sorted(evidence)
+
     return None
 
 
@@ -607,7 +842,7 @@ def _serialize_glycan_iupac(monos, links, root):
 
 
 def reconstruct_iupac_from_pdb(pdb_path, *, glycan_segment=None,
-                               bond_range=(1.20, 1.80)):
+                               bond_range=(1.20, 1.80), forcefield="charmm"):
     """Reconstruct connectivity, anomers and a provisional IUPAC from CHARMM PDB.
 
     Status meanings:
@@ -623,7 +858,35 @@ def reconstruct_iupac_from_pdb(pdb_path, *, glycan_segment=None,
                                       bond_range=bond_range)
     topology_files = _find_charmm_topology_files(pdb_path)
     topology_signatures = _topology_residue_signatures(topology_files)
-    resolved = [_topology_identity(r, topology_signatures) for r in residues]
+
+    resolved = [
+        _topology_identity(r, topology_signatures, forcefield=forcefield,)
+        for r in residues
+    ]
+    
+    # Preserve topology-derived residue names and anomers for GLYCAM only.
+    glycam_topology = {}
+
+    if forcefield == "glycam":
+        for i, identity in enumerate(resolved, start=1):
+            name, anomer, evidence = identity
+
+            topology_codes = {
+                entry.rsplit(":", 1)[-1]
+                for entry in evidence
+            }
+
+            if len(topology_codes) != 1:
+                raise ValueError(
+                    f"Ambiguous GLYCAM topology names for residue {i}: "
+                    f"{sorted(topology_codes)}"
+                )
+
+            glycam_topology[str(i)] = {
+                "name": next(iter(topology_codes)),
+                "anomer": anomer,
+            }
+    
     names = [item[0] if item else _identify_pdb_monosaccharide(r)
              for r, item in zip(residues, resolved)]
     contacts = _pdb_glycan_edges(residues, bond_range=bond_range)
@@ -690,17 +953,22 @@ def reconstruct_iupac_from_pdb(pdb_path, *, glycan_segment=None,
         'topology_sources': [str(f) for f in topology_files],
         'topology_residues_resolved': sum(x is not None for x in resolved),
     }
+    
+    if forcefield == "glycam":
+        details["glycam_topology"] = glycam_topology
+        
     return iupac, details
 
 
 def create_glycan_json(ROOT, glycan_id, iupac=None, pdb_path=None, output_path=None,
                        *, glycan_segment=None, overwrite=False,
-                       pdb_node_order=None):
+                       pdb_node_order=None, forcefield="charmm"):
     """Write glycan metadata with PDB-order IDs and IUPAC-derived labeled edges.
 
     With a PDB, atom-coordinate bond candidates provide the mapping.
     Never infer mapping simply from equal numbers of residues or PDB order.
     """
+    
     glycan_dir = find_glycan_directory(ROOT, glycan_id)
     if pdb_path is None:
         pdb_path = find_glycan_pdb(glycan_dir)
@@ -715,7 +983,7 @@ def create_glycan_json(ROOT, glycan_id, iupac=None, pdb_path=None, output_path=N
     reconstructed = None
     if iupac is None:
         iupac, reconstructed = reconstruct_iupac_from_pdb(
-            pdb_path, glycan_segment=glycan_segment)
+            pdb_path, glycan_segment=glycan_segment, forcefield=forcefield,)
         monos = reconstructed['monosaccharides']
         links = reconstructed['linkages']
         anomers = reconstructed['anomers']
@@ -799,6 +1067,22 @@ def create_glycan_json(ROOT, glycan_id, iupac=None, pdb_path=None, output_path=N
         }
     record['forcefield_residue_names'] = _forcefield_metadata(
         record['monosaccharides'],record['linkages'],new_anomers)
+    
+    # Add actual GLYCAM topology names and anomers only
+    # when reconstructing from a GLYCAM topology.
+    if forcefield == "glycam" and reconstructed is not None:
+
+        for old_node, topology_info in reconstructed["glycam_topology"].items():
+            node = remap[old_node]
+
+            record["forcefield_residue_names"][node][
+                "glycam06_topology_name"
+            ] = topology_info["name"]
+
+            record["forcefield_residue_names"][node][
+                "topology_anomer"
+            ] = topology_info["anomer"]
+    
     # Graph edges use stable PDB-order node identifiers when a PDB is supplied.
     record['graph_edges'] = [
         {'id':key,'parent':a,'child':b,'linkage':l}
